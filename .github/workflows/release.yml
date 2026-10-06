@@ -1,0 +1,40 @@
+# Push a tag like v1.2.0 → GitHub builds Mimiq-1.2.0-windows.zip and publishes a release.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check that the tag matches the app version
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          if ! grep -q "__version__ = \"$v\"" mimiq/__init__.py; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match __version__ in mimiq/__init__.py"
+            exit 1
+          fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+
+      - name: Check Python sources
+        run: python3 -m compileall -q mimiq tools
+
+      - name: Build the zip
+        run: |
+          git archive --format=zip --prefix=Mimiq/ -o "Mimiq-$VERSION-windows.zip" HEAD
+          unzip -l "Mimiq-$VERSION-windows.zip" | tail -1
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes=".github/release-notes.md"
+          gh release create "$GITHUB_REF_NAME" "Mimiq-$VERSION-windows.zip" \
+            --title "Mimiq $VERSION" --notes-file "$notes" --latest

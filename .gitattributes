@@ -1,0 +1,8 @@
+# Windows scripts must keep CRLF line endings — store them byte-for-byte
+*.bat -text
+*.py text eol=lf
+*.md text eol=lf
+
+# not part of the downloadable release
+.github/ export-ignore
+.gitattributes export-ignore

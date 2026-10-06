@@ -1,0 +1,17 @@
+# Mimiq — зависимости Python (Python 3.12 рекомендуется, подходит 3.11–3.13).
+# ONNX Runtime ставится отдельно установщиком (tools/install.py) — он сам выбирает
+# сборку под вашу видеокарту: onnxruntime-gpu (NVIDIA CUDA), onnxruntime-directml
+# (AMD / Intel) или onnxruntime (CPU). Две сборки одновременно ставить нельзя.
+
+PySide6-Essentials>=6.7
+numpy>=1.26
+opencv-python-headless>=4.9   # без GUI-модулей OpenCV — интерфейс на Qt
+onnx>=1.16
+aiohttp>=3.9
+cryptography>=42
+qrcode>=7.4
+Pillow>=10.2
+pillow-heif>=0.16          # фото с iPhone в формате HEIC
+pyvirtualcam>=0.11         # виртуальная камера (OBS Virtual Camera / Unity Capture)
+pygrabber>=0.2; sys_platform == "win32"   # имена камер DirectShow
+comtypes>=1.2; sys_platform == "win32"

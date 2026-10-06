@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Mimiq Link">
+<meta name="theme-color" content="#111113">
+<link rel="apple-touch-icon" href="/static/icon-180.png">
+<link rel="icon" href="/static/icon-180.png">
+<link rel="stylesheet" href="/static/app.css">
+<title>Mimiq Link</title>
+<script>window.MIMIQ_AUTH = __MIMIQ_AUTH__;</script>
+</head>
+<body>
+<video id="video" playsinline muted autoplay></video>
+<div class="shade"></div>
+
+<header class="top">
+  <div class="brand"><img src="/static/icon-180.png" alt=""><span>Mimiq <b>Link</b></span></div>
+  <div id="pill" class="pill"><i></i><span>Нет связи</span></div>
+</header>
+
+<section id="intro" class="sheet center">
+  <div class="glyph"><img src="/static/icon-180.png" alt=""></div>
+  <h1>iPhone → камера для Mimiq</h1>
+  <p class="muted">Держите телефон горизонтально на штативе, лицом к себе. Видео идёт напрямую на ваш ПК по Wi-Fi.</p>
+  <button id="startBtn" class="primary">Включить камеру</button>
+  <p id="introHint" class="hint"></p>
+  <details class="cert">
+    <summary>Убрать предупреждение Safari о сертификате</summary>
+    <ol>
+      <li><a href="/ca.crt">Скачайте сертификат Mimiq</a> и нажмите «Разрешить».</li>
+      <li>Настройки → Основные → VPN и управление устройством → «Mimiq Local CA» → Установить.</li>
+      <li>Настройки → Основные → Об этом устройстве → Доверие сертификатам → включите «Mimiq Local CA».</li>
+    </ol>
+  </details>
+</section>
+
+<section id="blocked" class="sheet center hidden">
+  <h1>Нужен доступ</h1>
+  <p id="blockedText" class="muted"></p>
+  <a class="ghost" href="/ca.crt">Скачать сертификат Mimiq</a>
+  <p class="hint">Настройки → Основные → VPN и управление устройством → установить профиль, затем Об этом устройстве → Доверие сертификатам → включить «Mimiq Local CA».</p>
+</section>
+
+<section id="live" class="controls hidden">
+  <div class="stats" id="stats">— к/с · — Мбит/с · — мс</div>
+  <div class="row">
+    <div class="seg grow" id="resSeg">
+      <button data-v="1280x720">720p</button><button data-v="1920x1080">1080p</button>
+    </div>
+    <div class="seg grow" id="fpsSeg">
+      <button data-v="30">30 к/с</button><button data-v="60">60 к/с</button>
+    </div>
+  </div>
+  <div class="row">
+    <button class="chip icon" id="flipBtn" title="Сменить камеру" aria-label="Сменить камеру">
+      <svg viewBox="0 0 24 24"><path d="M3 7h3l2-3h8l2 3h3v12H3z"/><path d="M9 13a3 3 0 0 0 5.2 2"/><path d="M15 11a3 3 0 0 0-5.2-2"/></svg>
+    </button>
+    <label class="slider"><span>Качество</span><input id="quality" type="range" min="50" max="95" step="1"><b id="qVal"></b></label>
+    <button class="chip icon" id="dimBtn" title="Затемнить экран" aria-label="Затемнить экран">
+      <svg viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+    </button>
+  </div>
+  <div class="camline" id="flipLabel">Фронтальная камера</div>
+</section>
+
+<div id="dim" class="dim hidden"><div><div class="rec"><i></i>Mimiq транслирует</div><p id="dimStats"></p><p class="muted">Коснитесь, чтобы вернуться</p></div></div>
+<div id="toast" class="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
