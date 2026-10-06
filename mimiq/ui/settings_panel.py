@@ -75,6 +75,7 @@ class SettingsPanel(QFrame):
     refreshCameras = Signal()
     vcamSetup = Signal(str)                # install | uninstall (Mimiq Camera)
     installTensorrt = Signal()
+    checkUpdates = Signal()                # manual "Проверить сейчас"
 
     def __init__(self, settings: Settings, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -445,7 +446,27 @@ class SettingsPanel(QFrame):
         card = Card(f"Mimiq {__version__}", "info")
         card.add(label("Локальная обработка: видео и фото не покидают ваш компьютер. Модели InsightFace / FaceFusion "
                        "распространяются для некоммерческого использования.", "faint", wrap=True))
+        card.add(SettingRow("Проверять обновления", self._toggle("check_updates"),
+                            "При запуске Mimiq спрашивает у GitHub номер последней версии. Больше ничего "
+                            "не отправляется"))
+        upd = QHBoxLayout()
+        upd.setContentsMargins(0, 0, 0, 0)
+        upd.setSpacing(8)
+        self.update_btn = QPushButton("Проверить сейчас")
+        self.update_btn.setObjectName("ghost")
+        self.update_btn.setCursor(POINTER)
+        self.update_btn.clicked.connect(self.checkUpdates.emit)
+        upd.addWidget(self.update_btn)
+        self.update_status = label("", "faint", wrap=True)
+        upd.addWidget(self.update_status, 1)
+        holder = QWidget()
+        holder.setLayout(upd)
+        card.add(holder)
         col.addWidget(card)
+
+    def set_update_status(self, text: str, busy: bool = False) -> None:
+        self.update_btn.setEnabled(not busy)
+        self.update_status.setText(text)
 
     def set_providers(self, available: Sequence[str], active: str, gpu_name: str = "") -> None:
         items = [("auto", "Авто")]
@@ -509,7 +530,8 @@ class SettingsPanel(QFrame):
         if not supported:
             self.mcam_sub.setText("Своя виртуальная камера Mimiq есть только в Windows.")
         elif installed:
-            self.mcam_sub.setText("Установлена — выберите «Mimiq Camera» в списке камер приложения.")
+            self.mcam_sub.setText("Установлена — выберите «Mimiq Camera» в списке камер приложения. "
+                                  "Нет в списке? Полностью перезапустите браузер или приложение для звонков.")
         else:
             note = f" (сейчас вместо неё зарегистрирована «{other}»)" if other else ""
             self.mcam_sub.setText("Своя камера Mimiq, OBS не нужен. Установка — один раз, Windows спросит права "

@@ -11,7 +11,7 @@ from PySide6.QtGui import QDesktopServices, QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton, QSizePolicy,
                                QVBoxLayout, QWidget)
 
-from .. import __version__, paths
+from .. import __version__, paths, updates
 from ..config import PRESET_LABELS, PRESETS, Settings
 from ..core import models
 from ..core.identity import Identity, IdentityLibrary
@@ -44,6 +44,7 @@ class _Bridge(QObject):
     cameras = Signal(list)
     gpu = Signal(str)
     mcam = Signal(dict)                    # Mimiq Camera status / (un)install result
+    update = Signal(object, str, bool)     # Release | None, error text, manual check
 
 
 class MainWindow(QMainWindow):
@@ -57,6 +58,8 @@ class MainWindow(QMainWindow):
         self._gpu_name = ""
         self._was_maximized = False
         self._link_connected = False
+        self._release: Optional[updates.Release] = None
+        self._update_busy = False
         self.setWindowTitle("Mimiq")
         self.setWindowIcon(QIcon(str(paths.package_dir() / "assets" / "mimiq.ico")))
         self.setMinimumSize(1280, 740)
@@ -126,6 +129,11 @@ class MainWindow(QMainWindow):
         self.custom_badge.setToolTip("Вы изменили параметры вручную. Выберите режим, чтобы вернуть пресет.")
         h.addWidget(self.custom_badge, 0, mid)
         h.addStretch(1)
+        self.update_chip = Chip("Доступно обновление")
+        self.update_chip.setCursor(POINTER)
+        self.update_chip.clicked.connect(self._show_update)
+        self.update_chip.hide()
+        h.addWidget(self.update_chip, 0, mid)
         self.provider_chip = Chip("Подготовка…", "chip")
         self.provider_chip.setToolTip("Чем считаются нейросети")
         h.addWidget(self.provider_chip, 0, mid)
@@ -251,6 +259,8 @@ class MainWindow(QMainWindow):
         self._bridge.mcam.connect(self._on_mcam)
         self.settings_panel.vcamSetup.connect(self._vcam_setup)
         self.settings_panel.installTensorrt.connect(self._install_tensorrt)
+        self.settings_panel.checkUpdates.connect(lambda: self.check_updates(manual=True))
+        self._bridge.update.connect(self._on_update)
 
     def _shortcuts(self) -> None:
         for seq, fn in (("Space", self.toggle_run), ("F11", self.toggle_fullscreen), ("Ctrl+S", self.snapshot),
@@ -293,6 +303,8 @@ class MainWindow(QMainWindow):
         self.refresh_cameras()
         threading.Thread(target=lambda: self._bridge.gpu.emit(gpu_name()), daemon=True).start()
         self._refresh_mcam()
+        if s.check_updates:
+            QTimer.singleShot(5000, self.check_updates)   # after start-up, so it never slows the launch
 
     # ================================================================== settings
     def update_settings(self, kw: Dict, from_preset: bool = False, origin: str = "") -> None:
@@ -326,6 +338,8 @@ class MainWindow(QMainWindow):
                 self.refresh_cameras()
         if ch & {"output_width", "output_height"}:
             self._render_brand_frames()
+        if "check_updates" in ch and new.check_updates and self._release is None:
+            self.check_updates()
         if origin == "panel":
             self.settings_panel.s = new.copy()
         else:
@@ -693,12 +707,68 @@ class MainWindow(QMainWindow):
         if "result" not in st:
             return
         if st.get("ok"):
-            extra = (" Выберите её в Zoom, Teams, Discord или Telegram. Если приложение было открыто — "
-                     "перезапустите его." if st.get("action") == "install" else "")
-            self.toasts.show("ok", st["result"] + extra, 7000)
+            install = st.get("action") == "install"
+            extra = (" Перезапустите браузер и приложения для звонков (Zoom, Teams, Discord, Telegram) — "
+                     "только после перезапуска они увидят новую камеру. Chrome и Edge работают в фоне: "
+                     "откройте chrome://restart или edge://restart." if install else "")
+            self.toasts.show("ok", st["result"] + extra, 14000 if install else 7000)
             self.engine.restart_output()
         else:
             self.toasts.show("error", st["result"], 8000)
+
+    # ================================================================== updates
+    def check_updates(self, manual: bool = False) -> None:
+        if self._update_busy:
+            return
+        self._update_busy = True
+        if manual:
+            self.settings_panel.set_update_status("Проверяю…", busy=True)
+
+        def job():
+            rel, err = updates.check()
+            self._bridge.update.emit(rel, err, manual)
+        threading.Thread(target=job, daemon=True, name="mimiq-update").start()
+
+    def _on_update(self, rel: Optional[updates.Release], err: str, manual: bool) -> None:
+        self._update_busy = False
+        if rel is None:
+            text = err or f"У вас последняя версия — {__version__}."
+            self.settings_panel.set_update_status(text if manual or not err else "")
+            if manual:
+                self.toasts.show("error" if err else "ok", text, 5000)
+            return
+        first = self._release is None or self._release.version != rel.version
+        self._release = rel
+        self.update_chip.set(f"Доступна {rel.version}", theme.OK, "Новая версия Mimiq — нажмите, чтобы узнать, что нового")
+        self.update_chip.show()
+        self.settings_panel.set_update_status(f"Доступна версия {rel.version}.")
+        if manual:
+            self._show_update()
+        elif first:
+            self.toasts.show("info", f"Вышла Mimiq {rel.version}. Нажмите «Доступна {rel.version}» вверху, "
+                                     f"чтобы узнать, что нового.", 9000)
+
+    def _show_update(self) -> None:
+        rel = self._release
+        if rel is None:
+            return
+        text = f"Вышла Mimiq {rel.version} (у вас {__version__})."
+        if rel.notes:
+            text += "\n\n" + rel.notes
+        text += ("\n\nКак обновиться: скачайте архив, распакуйте его поверх папки Mimiq (папки .venv и models "
+                 "сохранятся) и запустите install.bat.")
+        box = QMessageBox(QMessageBox.Icon.NoIcon, "Доступно обновление", text,
+                          QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes, self)
+        box.button(QMessageBox.StandardButton.Yes).setText("Скачать")
+        box.button(QMessageBox.StandardButton.Yes).setObjectName("primary")
+        box.button(QMessageBox.StandardButton.Cancel).setText("Позже")
+        details = box.addButton("Страница релиза", QMessageBox.ButtonRole.ActionRole)
+        details.setObjectName("ghost")
+        res = box.exec()
+        if box.clickedButton() is details:
+            QDesktopServices.openUrl(QUrl(rel.url))
+        elif res == QMessageBox.StandardButton.Yes:
+            QDesktopServices.openUrl(QUrl(rel.download))
 
     # ================================================================== misc
     def refresh_cameras(self) -> None:

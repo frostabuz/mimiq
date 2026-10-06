@@ -320,6 +320,9 @@ def install_camera() -> None:
         return
     ok, msg = vcam_setup.run("install")
     say(f"  {'✓' if ok else '✗'} {msg}", "ok" if ok else "warn")
+    if ok:
+        say("  Перезапустите браузер и приложения для звонков — только после перезапуска они увидят камеру.", "dim")
+        say("  Chrome и Edge работают в фоне: откройте chrome://restart или edge://restart.", "dim")
     if not ok:
         say("  Можно установить позже в Mimiq: «Вывод» → «Установить».", "dim")
 
@@ -440,6 +443,7 @@ def main(argv) -> int:
     say("  ✓ Mimiq установлен!", "ok")
     say("  Запуск: ярлык «Mimiq» на рабочем столе или Mimiq.bat", "dim")
     say("  Виртуальная камера: в Zoom, Teams, Discord или Telegram выберите «Mimiq Camera».", "dim")
+    say("  Нет в списке? Полностью перезапустите это приложение или браузер.", "dim")
     if WIN and "--no-launch" not in argv and ask("Запустить Mimiq сейчас?"):
         subprocess.Popen([str(Path(PY).with_name("pythonw.exe")), "-m", "mimiq"], cwd=str(ROOT),
                          creationflags=0x00000008)  # DETACHED_PROCESS

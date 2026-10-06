@@ -87,6 +87,7 @@ class Settings:
     preset: str = "balanced"
     consent_accepted: bool = False
     first_run_done: bool = False
+    check_updates: bool = True           # ask GitHub Releases for a newer version at start-up
     settings_version: int = SETTINGS_VERSION
 
     # ------------------------------------------------------------------
