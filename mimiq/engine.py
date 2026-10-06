@@ -156,11 +156,24 @@ class Engine(QObject):
                 models.resolve_provider(s.execution_provider), "CPU") + "…")
             self.hub.configure(s.execution_provider, s.gpu_device)
             keys = list(dict.fromkeys(s.required_models()))
+            trt = self.hub.provider == "tensorrt"
             for i, key in enumerate(keys):
                 if cancel.is_set():
                     return
+                title = models.REGISTRY[key].title
+                build = trt and models.uses_tensorrt(key) and not models.tensorrt_cached(key)
+                if build:
+                    self.modelProgress.emit("load", i / len(keys),
+                                            f"TensorRT: оптимизация «{title}» · один раз, 1–3 мин…")
                 self.hub.get(key)
-                self.modelProgress.emit("load", (i + 1) / len(keys), f"Загрузка {models.REGISTRY[key].title}…")
+                if trt:
+                    self.hub.prime(key)
+                self.modelProgress.emit("load", (i + 1) / len(keys), f"Загрузка {title}…")
+            failed = self.hub.trt_failed
+            if failed:
+                names = ", ".join(models.REGISTRY[k].title for k in failed)
+                self.message.emit("warn", f"TensorRT не запустился для: {names} — они работают на CUDA. "
+                                          "Подробности в логах.")
             self._pending_settings = s
             if self.running:
                 self._reconfigure.set()
@@ -227,6 +240,10 @@ class Engine(QObject):
             self._output_restart.set()
         if "multi_face" in changed or "detector_model" in changed:
             self.pipeline.reset_tracking()
+
+    def restart_output(self) -> None:
+        """Re-open the virtual camera (e.g. after Mimiq Camera was installed)."""
+        self._output_restart.set()
 
     def set_identity(self, ident: Optional[Identity]) -> None:
         self.identity = ident
@@ -693,7 +710,7 @@ class Engine(QObject):
             s = self.settings
             if self._output_restart.is_set():
                 self._output_restart.clear()
-                self.vcam.close()
+                self.vcam.close(self._farewell(s))
                 retry_at = 0.0
                 self.vcamStatus.emit(False, "")
             if s.vcam_enabled and not self.vcam.active and time.monotonic() >= retry_at:
@@ -706,7 +723,7 @@ class Engine(QObject):
                         last_err = self.vcam.error
                         self.vcamStatus.emit(False, self.vcam.error or "")
             if not s.vcam_enabled and self.vcam.active:
-                self.vcam.close()
+                self.vcam.close(self._farewell(s))
                 self.vcamStatus.emit(False, "")
             with self._out_lock:
                 frame = self._latest_out
@@ -729,8 +746,18 @@ class Engine(QObject):
                 self.vcam.wait()
             else:
                 time.sleep(1.0 / max(s.output_fps, 1))
-        self.vcam.close()
+        self.vcam.close(self._farewell(self.settings))
         self.vcamStatus.emit(False, "")
+
+    def _farewell(self, s: Settings) -> Optional[np.ndarray]:
+        """Pause card for the virtual camera when the stream stops (Mimiq Camera keeps the last frame)."""
+        card = self.placeholder
+        if card is None or not self.vcam.active or self.vcam.backend != "mimiq":
+            return None
+        w, h = self.vcam.size
+        if card.shape[1] != w or card.shape[0] != h:
+            card = fit_frame(card, w, h, "fit")
+        return card
 
     # ================================================================== captures
     def snapshot(self) -> Optional[Path]:

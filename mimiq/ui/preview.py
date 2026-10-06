@@ -101,10 +101,16 @@ class _EmptyState(QWidget):
         self._suppress_hint = on
         self._update_hint()
 
+    def set_hint_covered(self, on: bool) -> None:
+        """Hide the bottom hint line while the model-loading card is drawn over it."""
+        if getattr(self, "_covered", False) != on:
+            self._covered = on
+            self._update_hint()
+
     def _update_hint(self) -> None:
         # keep the space reserved, so the centred content does not jump when the hint hides
         self.hint.setVisible(bool(self.hint.text()))
-        hidden = getattr(self, "_suppress_hint", False)
+        hidden = getattr(self, "_suppress_hint", False) or getattr(self, "_covered", False)
         self.hint.setStyleSheet("color: transparent;" if hidden else "")
 
 
@@ -208,6 +214,7 @@ class PreviewWidget(QWidget):
 
     def set_loading(self, stage: Optional[str], frac: float = 0.0, text: str = "") -> None:
         self._loading = None if stage in (None, "done") else (stage, frac, text)
+        self.empty.set_hint_covered(self._loading is not None)
         self.update()
 
     def set_recording(self, on: bool) -> None:

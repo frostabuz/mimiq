@@ -69,7 +69,7 @@ class Settings:
     fade_ms: int = 250
     # ---- output ----------------------------------------------------------------------
     vcam_enabled: bool = True
-    vcam_backend: str = "auto"           # auto | obs | unitycapture
+    vcam_backend: str = "auto"           # auto (Mimiq Camera, else OBS) | mimiq | obs
     output_width: int = 1280
     output_height: int = 720
     output_fps: int = 30
@@ -125,6 +125,8 @@ class Settings:
                         setattr(s, k, v)
                 if int(data.get("settings_version", 1)) < SETTINGS_VERSION:
                     s.migrate(int(data.get("settings_version", 1)))
+                if s.vcam_backend not in ("auto", "mimiq", "obs"):
+                    s.vcam_backend = "mimiq" if s.vcam_backend == "unitycapture" else "auto"
             except Exception as exc:
                 log.warning("settings unreadable, using defaults: %s", exc)
         return s

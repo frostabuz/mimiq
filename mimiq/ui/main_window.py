@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import Dict, Optional
 
 from PySide6.QtCore import QObject, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QIcon, QKeySequence, QShortcut
-from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QMainWindow, QPushButton, QSizePolicy, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton, QSizePolicy,
+                               QVBoxLayout, QWidget)
 
 from .. import __version__, paths
 from ..config import PRESET_LABELS, PRESETS, Settings
@@ -16,6 +18,7 @@ from ..core.identity import Identity, IdentityLibrary
 from ..core.tuner import rate_text
 from ..engine import Engine
 from ..imaging import to_qimage
+from ..io import vcam_setup
 from . import brand, icons, theme
 from .dialogs import ConnectDialog
 from .faces import FacesPanel, NewFaceDialog, expand_paths, pick_photos
@@ -40,6 +43,7 @@ STAGE_NAMES = (("track", "трекинг"), ("swap", "замена"), ("enhance"
 class _Bridge(QObject):
     cameras = Signal(list)
     gpu = Signal(str)
+    mcam = Signal(dict)                    # Mimiq Camera status / (un)install result
 
 
 class MainWindow(QMainWindow):
@@ -244,6 +248,9 @@ class MainWindow(QMainWindow):
         self._bridge = _Bridge()
         self._bridge.cameras.connect(self.settings_panel.set_cameras)
         self._bridge.gpu.connect(self._on_gpu_name)
+        self._bridge.mcam.connect(self._on_mcam)
+        self.settings_panel.vcamSetup.connect(self._vcam_setup)
+        self.settings_panel.installTensorrt.connect(self._install_tensorrt)
 
     def _shortcuts(self) -> None:
         for seq, fn in (("Space", self.toggle_run), ("F11", self.toggle_fullscreen), ("Ctrl+S", self.snapshot),
@@ -285,6 +292,7 @@ class MainWindow(QMainWindow):
             log.warning("providers unavailable: %s", exc)
         self.refresh_cameras()
         threading.Thread(target=lambda: self._bridge.gpu.emit(gpu_name()), daemon=True).start()
+        self._refresh_mcam()
 
     # ================================================================== settings
     def update_settings(self, kw: Dict, from_preset: bool = False, origin: str = "") -> None:
@@ -627,6 +635,70 @@ class MainWindow(QMainWindow):
         self.provider_chip.set(text, theme.OK if prov != "cpu" else theme.WARN,
                                models.PROVIDER_LABELS.get(prov, prov))
         self.right_text.setText(f"{models.PROVIDER_LABELS.get(prov, prov)}  ·  Mimiq {__version__}")
+
+    def _install_tensorrt(self) -> None:
+        bat = paths.app_root() / "install.bat"
+        if not bat.exists():
+            self.toasts.show("error", "Не найден install.bat в папке Mimiq.", 6000)
+            return
+        try:
+            os.startfile(str(bat), "open", "tensorrt", str(paths.app_root()))  # type: ignore[attr-defined]
+        except Exception as exc:
+            self.toasts.show("error", f"Не удалось открыть установщик: {exc}", 6000)
+            return
+        self.toasts.show("info", "Открылось окно установки TensorRT (≈1,9 ГБ). Когда оно закончит — "
+                                 "перезапустите Mimiq.", 9000)
+
+    # ================================================================== Mimiq Camera
+    def _refresh_mcam(self) -> None:
+        def job():
+            try:
+                st = vcam_setup.status()
+            except Exception as exc:
+                log.warning("Mimiq Camera status failed: %s", exc)
+                st = {"supported": vcam_setup.supported(), "installed": False, "name": None, "other": False}
+            self._bridge.mcam.emit(st)
+        threading.Thread(target=job, daemon=True, name="mimiq-mcam").start()
+
+    def _vcam_setup(self, action: str) -> None:
+        if action == "uninstall":
+            box = QMessageBox(QMessageBox.Icon.NoIcon, "Удалить Mimiq Camera",
+                              "Камера «Mimiq Camera» пропадёт из списка камер во всех приложениях. "
+                              "Вернуть её можно кнопкой «Установить».",
+                              QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes, self)
+            box.button(QMessageBox.StandardButton.Yes).setText("Удалить")
+            box.button(QMessageBox.StandardButton.Yes).setObjectName("danger")
+            box.button(QMessageBox.StandardButton.Cancel).setText("Отмена")
+            if box.exec() != QMessageBox.StandardButton.Yes:
+                return
+        self.settings_panel.set_mcam_state(True, action == "uninstall",
+                                           "Подтвердите запрос Windows о правах администратора…")
+        if self.engine.vcam.backend == "mimiq":
+            self.engine.restart_output()       # release the camera before it is re-registered
+
+        def job():
+            try:
+                ok, msg = vcam_setup.run(action)
+            except Exception as exc:
+                log.exception("Mimiq Camera %s failed", action)
+                ok, msg = False, str(exc)
+            st = vcam_setup.status()
+            st.update(result=msg, ok=ok, action=action)
+            self._bridge.mcam.emit(st)
+        threading.Thread(target=job, daemon=True, name="mimiq-mcam").start()
+
+    def _on_mcam(self, st: dict) -> None:
+        other = st.get("name") if st.get("other") else ""
+        self.settings_panel.set_mcam_state(bool(st.get("supported")), bool(st.get("installed")), other=other or "")
+        if "result" not in st:
+            return
+        if st.get("ok"):
+            extra = (" Выберите её в Zoom, Teams, Discord или Telegram. Если приложение было открыто — "
+                     "перезапустите его." if st.get("action") == "install" else "")
+            self.toasts.show("ok", st["result"] + extra, 7000)
+            self.engine.restart_output()
+        else:
+            self.toasts.show("error", st["result"], 8000)
 
     # ================================================================== misc
     def refresh_cameras(self) -> None:

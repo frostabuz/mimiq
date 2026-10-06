@@ -190,19 +190,159 @@ def ort():
         if _ort is None:
             import onnxruntime as _rt
             _rt.set_default_logger_severity(3)
+            cuda = "CUDAExecutionProvider" in _rt.get_available_providers()
             if sys.platform == "win32" and hasattr(_rt, "preload_dlls"):
                 try:
-                    if "CUDAExecutionProvider" in _rt.get_available_providers():
+                    if cuda:
                         _rt.preload_dlls()
                 except Exception as exc:  # pragma: no cover - depends on host
                     log.warning("preload_dlls failed: %s", exc)
+            if cuda and "TensorrtExecutionProvider" in _rt.get_available_providers():
+                _setup_tensorrt(_rt)
             _ort = _rt
     return _ort
 
 
+# --------------------------------------------------------------------------------------
+# TensorRT (optional, NVIDIA RTX): libraries come from the pip wheel tensorrt-cu13-libs / tensorrt-cu12-libs
+# --------------------------------------------------------------------------------------
+
+TRT_KINDS = {"swapper", "enhancer", "occluder", "parser", "landmarker"}
+TRT_SKIP = {"codeformer"}       # float64 "fidelity" input, TensorRT can't take it
+# FP16 only where it is known to be safe: the FP16 swapper already computes in half precision, masks and
+# landmarks are robust. GAN enhancers / HyperSwap stay in FP32 (TF32) — no risk of overflow artefacts.
+TRT_FP16 = {"inswapper_128_fp16", "inswapper_128", "xseg_1", "xseg_2", "xseg_3", "bisenet_resnet_18",
+            "bisenet_resnet_34", "2dfan4"}
+TRT_DISTS = ("tensorrt-cu13-libs", "tensorrt-cu12-libs", "tensorrt-libs", "tensorrt")
+_DLL_DIRS: list = []
+_trt: Dict[str, object] = {"ok": False, "reason": "нужна видеокарта NVIDIA с CUDA", "version": "", "dir": ""}
+
+
+def ort_tensorrt_major(rt=None) -> Optional[int]:
+    """TensorRT major version the installed onnxruntime-gpu was built for (nvinfer_10.dll → 10)."""
+    import re
+    try:
+        if rt is not None:
+            capi = Path(rt.__file__).resolve().parent / "capi"
+        else:
+            import importlib.util
+            spec = importlib.util.find_spec("onnxruntime")
+            if spec is None or not spec.submodule_search_locations:
+                return None
+            capi = Path(list(spec.submodule_search_locations)[0]) / "capi"
+        for name in ("onnxruntime_providers_tensorrt.dll", "libonnxruntime_providers_tensorrt.so"):
+            f = capi / name
+            if f.exists():
+                m = re.search(rb"(?:nvinfer_(\d+)\.dll|libnvinfer\.so\.(\d+))", f.read_bytes())
+                if m:
+                    return int(m.group(1) or m.group(2))
+    except Exception as exc:
+        log.debug("TensorRT major lookup failed: %s", exc)
+    return None
+
+
+def _tensorrt_libs_dir() -> Optional[Path]:
+    import importlib.util
+    try:
+        spec = importlib.util.find_spec("tensorrt_libs")   # not imported: its __init__ loads ~2 GB of DLLs
+    except Exception:
+        return None
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    return Path(list(spec.submodule_search_locations)[0])
+
+
+def _tensorrt_version() -> str:
+    import importlib.metadata as md
+    for dist in TRT_DISTS:
+        try:
+            return md.version(dist)
+        except md.PackageNotFoundError:
+            continue
+    return ""
+
+
+def _setup_tensorrt(rt) -> None:
+    """Make the TensorRT DLLs findable for ONNX Runtime's TensorRT provider and check that they load."""
+    import ctypes
+    major = ort_tensorrt_major(rt)
+    folder = _tensorrt_libs_dir()
+    if folder is None:
+        _trt.update(ok=False, reason="библиотеки TensorRT не установлены")
+        return
+    if major is None:
+        _trt.update(ok=False, reason="эта сборка ONNX Runtime без TensorRT")
+        return
+    win = sys.platform == "win32"
+    names = ([f"nvinfer_{major}.dll", f"nvinfer_plugin_{major}.dll", f"nvonnxparser_{major}.dll"] if win else
+             [f"libnvinfer.so.{major}", f"libnvinfer_plugin.so.{major}", f"libnvonnxparser.so.{major}"])
+    if not (folder / names[0]).exists():
+        _trt.update(ok=False, reason=f"нужен TensorRT {major}.x — запустите install.bat tensorrt")
+        return
+    try:
+        if win:
+            _DLL_DIRS.append(os.add_dll_directory(str(folder)))
+        # nvinfer loads its per-GPU builder resources by name later on → keep the folder on PATH
+        os.environ["PATH"] = str(folder) + os.pathsep + os.environ.get("PATH", "")
+        for name in names:
+            if (folder / name).exists():
+                if win:
+                    ctypes.WinDLL(str(folder / name))
+                else:
+                    ctypes.CDLL(str(folder / name), mode=ctypes.RTLD_GLOBAL)
+    except OSError as exc:
+        _trt.update(ok=False, reason=f"не загрузились библиотеки TensorRT: {exc}")
+        log.warning("TensorRT libraries failed to load: %s", exc)
+        return
+    _trt.update(ok=True, reason="", version=_tensorrt_version(), dir=str(folder))
+    log.info("TensorRT %s ready (%s)", _trt["version"], folder)
+
+
+def tensorrt_status() -> dict:
+    """{"ok": bool, "reason": str, "version": str} — whether the TensorRT provider can really be used."""
+    try:
+        ort()
+    except Exception as exc:
+        return {"ok": False, "reason": str(exc), "version": ""}
+    return dict(_trt)
+
+
+def tensorrt_cache_dir() -> Path:
+    """Engine cache. TensorRT/ONNX Runtime can't handle non-ASCII paths on Windows (Cyrillic user names)."""
+    from ..imaging import ascii_safe_dir
+    tag = "trt-" + (str(_trt.get("version") or "x").replace("/", "_"))
+    folder = paths.cache_dir() / "tensorrt" / tag
+    folder.mkdir(parents=True, exist_ok=True)
+    safe = ascii_safe_dir(folder)
+    if safe.name == "Mimiq-temp":                 # public fallback folder → keep versions apart
+        safe = safe / "tensorrt" / tag
+        safe.mkdir(parents=True, exist_ok=True)
+    return safe
+
+
+def uses_tensorrt(key: str) -> bool:
+    spec = REGISTRY.get(key)
+    return spec is not None and spec.kind in TRT_KINDS and key not in TRT_SKIP
+
+
+def _cache_prefix(key: str) -> str:
+    # trailing "_x": no key's prefix is a prefix of another key's (inswapper_128 vs inswapper_128_fp16)
+    return "mimiq_" + "".join(c if c.isalnum() else "_" for c in key) + "_x"
+
+
+def tensorrt_cached(key: str) -> bool:
+    try:
+        return any(tensorrt_cache_dir().glob(_cache_prefix(key) + "*.engine"))
+    except Exception:
+        return False
+
+
 def available_providers() -> List[str]:
     ids = set(ort().get_available_providers())
-    return [k for k, v in PROVIDER_IDS.items() if v in ids]
+    out = [k for k, v in PROVIDER_IDS.items() if v in ids]
+    if "tensorrt" in out and not _trt.get("ok"):
+        out.remove("tensorrt")                       # the provider is compiled in, but its libraries are missing
+    return out
 
 
 def resolve_provider(choice: str) -> str:
@@ -213,37 +353,40 @@ def resolve_provider(choice: str) -> str:
         return "cpu"
     if choice != "auto" and choice in avail:
         return choice
-    for k in ("cuda", "directml", "coreml", "cpu"):
+    for k in ("tensorrt", "cuda", "directml", "coreml", "cpu"):
         if k in avail:
             return k
     return "cpu"
 
 
-def _provider_chain(kind: str, device_id: int) -> list:
+def _cuda_options(device_id: int) -> dict:
+    return {"device_id": device_id, "cudnn_conv_algo_search": "EXHAUSTIVE", "cudnn_conv_use_max_workspace": "1",
+            "do_copy_in_default_stream": True}
+
+
+def _provider_chain(kind: str, device_id: int, key: str = "") -> list:
     cpu = "CPUExecutionProvider"
     if kind == "tensorrt":
-        trt_cache = str(paths.cache_dir() / "tensorrt")
-        os.makedirs(trt_cache, exist_ok=True)
+        if not uses_tensorrt(key):          # detector (changing input sizes) & co. → plain CUDA
+            return [("CUDAExecutionProvider", _cuda_options(device_id)), cpu]
+        trt_cache = str(tensorrt_cache_dir())
         return [
             ("TensorrtExecutionProvider", {
                 "device_id": device_id,
-                "trt_fp16_enable": True,
+                "trt_fp16_enable": key in TRT_FP16,
                 "trt_engine_cache_enable": True,
                 "trt_engine_cache_path": trt_cache,
+                "trt_engine_cache_prefix": _cache_prefix(key),
                 "trt_timing_cache_enable": True,
                 "trt_timing_cache_path": trt_cache,
                 "trt_builder_optimization_level": 3,
+                "trt_max_workspace_size": 2 << 30,
             }),
-            ("CUDAExecutionProvider", {"device_id": device_id}),
+            ("CUDAExecutionProvider", _cuda_options(device_id)),
             cpu,
         ]
     if kind == "cuda":
-        return [("CUDAExecutionProvider", {
-            "device_id": device_id,
-            "cudnn_conv_algo_search": "EXHAUSTIVE",
-            "cudnn_conv_use_max_workspace": "1",
-            "do_copy_in_default_stream": True,
-        }), cpu]
+        return [("CUDAExecutionProvider", _cuda_options(device_id)), cpu]
     if kind == "directml":
         return [("DmlExecutionProvider", {"device_id": device_id}), cpu]
     if kind == "coreml":
@@ -291,13 +434,25 @@ class SessionHub:
         """Provider really used by the loaded sessions.
 
         ONNX Runtime silently falls back to CPU when, for example, CUDA/cuDNN DLLs are missing,
-        so the requested provider alone is not a reliable indicator."""
+        so the requested provider alone is not a reliable indicator. With TensorRT some models
+        (the detector) intentionally run on CUDA — that still counts as TensorRT."""
         with self._lock:
             acts = set(self._actual.values())
         if not acts:
             return self.provider
+        if "CPUExecutionProvider" in acts and self.provider != "cpu":
+            return "cpu"
+        if self.provider == "tensorrt":
+            return "tensorrt" if "TensorrtExecutionProvider" in acts else "cuda"
         worst = max(acts, key=lambda a: _RANK.get(a, 9))
         return _BY_ID.get(worst, "cpu")
+
+    @property
+    def trt_failed(self) -> List[str]:
+        """Models that should have run on TensorRT but fell back to CUDA."""
+        with self._lock:
+            return [k for k, a in self._actual.items()
+                    if self.provider == "tensorrt" and uses_tensorrt(k) and a != "TensorrtExecutionProvider"]
 
     @property
     def degraded(self) -> bool:
@@ -320,7 +475,7 @@ class SessionHub:
                 spec = REGISTRY[key]
                 if not is_installed(key):
                     raise FileNotFoundError(f"Модель {spec.file} не скачана")
-                sess = LockedSession(self._create(spec.path))
+                sess = LockedSession(self._create(spec.path, key))
                 self._sessions[key] = sess
                 try:
                     self._actual[key] = sess.get_providers()[0]
@@ -336,7 +491,31 @@ class SessionHub:
                     del self._sessions[k]
                     self._actual.pop(k, None)
 
-    def _create(self, path: Path):
+    def prime(self, key: str) -> None:
+        """Run a model once with dummy inputs. With TensorRT this builds the engine now (minutes on the very first
+        start, then loaded from the cache) instead of freezing the video later. If TensorRT fails at run time the
+        model is reloaded on CUDA."""
+        import numpy as np
+        sess = self.get(key)
+        if self._actual.get(key) != "TensorrtExecutionProvider":
+            return
+        dtypes = {"tensor(float)": np.float32, "tensor(float16)": np.float16, "tensor(double)": np.float64,
+                  "tensor(int64)": np.int64, "tensor(int32)": np.int32}
+        try:
+            feed = {}
+            for inp in sess.get_inputs():
+                shape = [d if isinstance(d, int) and d > 0 else 1 for d in inp.shape]
+                feed[inp.name] = np.zeros(shape, dtypes.get(inp.type, np.float32))
+            sess.run(None, feed)
+        except Exception as exc:
+            log.error("TensorRT failed for %s (%s) — using CUDA for it", key, exc)
+            with self._lock:
+                spec = REGISTRY[key]
+                cuda = LockedSession(self._create(spec.path, key, force="cuda"))
+                self._sessions[key] = cuda
+                self._actual[key] = cuda.get_providers()[0]
+
+    def _create(self, path: Path, key: str = "", force: str = ""):
         rt = ort()
         so = rt.SessionOptions()
         so.log_severity_level = 3
@@ -351,16 +530,29 @@ class SessionHub:
         if self.provider == "directml":
             so.enable_mem_pattern = False
             so.execution_mode = rt.ExecutionMode.ORT_SEQUENTIAL
-        chain = _provider_chain(self.provider, self.device_id)
+        kind = force or self.provider
+        chain = _provider_chain(kind, self.device_id, key)
+        t0 = time.monotonic()
         try:
             sess = rt.InferenceSession(str(path), sess_options=so, providers=chain)
         except Exception as exc:
-            if self.provider == "cpu":
+            if kind == "cpu":
                 raise
-            log.error("provider %s failed for %s (%s); falling back to CPU", self.provider, path.name, exc)
-            sess = rt.InferenceSession(str(path), sess_options=so, providers=["CPUExecutionProvider"])
+            sess = None
+            if kind == "tensorrt":
+                log.error("TensorRT failed for %s (%s); trying CUDA", path.name, exc)
+                try:
+                    sess = rt.InferenceSession(str(path), sess_options=so,
+                                               providers=_provider_chain("cuda", self.device_id, key))
+                except Exception as exc2:
+                    exc = exc2
+            if sess is None:
+                log.error("provider %s failed for %s (%s); falling back to CPU", kind, path.name, exc)
+                sess = rt.InferenceSession(str(path), sess_options=so, providers=["CPUExecutionProvider"])
         active = sess.get_providers()[0]
         if self.provider != "cpu" and active == "CPUExecutionProvider":
             log.warning("%s: %s is unavailable, ONNX Runtime fell back to CPU", path.name, self.provider)
-        log.info("loaded %s on %s", path.name, active)
+        if kind == "tensorrt" and uses_tensorrt(key) and active != "TensorrtExecutionProvider":
+            log.warning("%s: TensorRT unavailable, running on %s", path.name, active)
+        log.info("loaded %s on %s in %.1f s", path.name, active, time.monotonic() - t0)
         return sess

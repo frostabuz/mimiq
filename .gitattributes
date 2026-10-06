@@ -2,6 +2,7 @@
 *.bat -text
 *.py text eol=lf
 *.md text eol=lf
+*.dll binary
 
 # not part of the downloadable release
 .github/ export-ignore

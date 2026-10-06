@@ -1,6 +1,7 @@
 """Right-hand settings column: Source · Swap · Mask · Output tabs."""
 from __future__ import annotations
 
+import sys
 from typing import Callable, Dict, List, Optional, Sequence
 
 from PySide6.QtCore import QSize, Qt, Signal
@@ -72,6 +73,8 @@ class SettingsPanel(QFrame):
     connectRequested = Signal()
     openFolder = Signal(str)
     refreshCameras = Signal()
+    vcamSetup = Signal(str)                # install | uninstall (Mimiq Camera)
+    installTensorrt = Signal()
 
     def __init__(self, settings: Settings, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -363,13 +366,37 @@ class SettingsPanel(QFrame):
         holder = QWidget()
         holder.setLayout(st)
         card.add(holder)
-        card.add(FieldRow("Драйвер", self._combo("vcam_backend", [("auto", "Авто"), ("obs", "OBS Virtual Camera"),
-                                                                  ("unitycapture", "Unity Capture")])))
+        # --- Mimiq Camera (own virtual camera, no OBS needed)
+        mc = QFrame()
+        mc.setObjectName("mcamBox")
+        mc.setStyleSheet(f"#mcamBox {{ background: {theme.CARD}; border: 1px solid {theme.LINE}; "
+                         f"border-radius: 6px; }}")
+        ml = QHBoxLayout(mc)
+        ml.setContentsMargins(10, 8, 8, 8)
+        ml.setSpacing(8)
+        txt = QVBoxLayout()
+        txt.setSpacing(0)
+        self.mcam_title = label("Mimiq Camera", wrap=True)
+        self.mcam_title.setStyleSheet("font-weight: 600;")
+        self.mcam_sub = label("Проверяю…", "faint", wrap=True)
+        txt.addWidget(self.mcam_title)
+        txt.addWidget(self.mcam_sub)
+        ml.addLayout(txt, 1)
+        self.mcam_btn = QPushButton("Установить")
+        self.mcam_btn.setObjectName("primary")
+        self.mcam_btn.setStyleSheet("padding: 6px 12px;")
+        self.mcam_btn.setCursor(POINTER)
+        self.mcam_btn.clicked.connect(self._on_mcam_button)
+        ml.addWidget(self.mcam_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._mcam_installed = False
+        card.add(mc)
+        card.add(FieldRow("Драйвер", self._combo("vcam_backend", [("auto", "Авто"), ("mimiq", "Mimiq Camera"),
+                                                                  ("obs", "OBS Virtual Camera")])))
         card.add(FieldRow("Разрешение", self._size_combo("output_width", "output_height", OUT_RES)))
         card.add(FieldRow("Кадров в секунду", self._seg("output_fps", [(24, "24"), (25, "25"), (30, "30"), (60, "60")])))
         card.add(FieldRow("Заполнение кадра", self._seg("output_fit", [("crop", "Обрезать"), ("fit", "Вписать")])))
-        card.add(label("В приложении выберите камеру «OBS Virtual Camera». Для работы нужен установленный OBS Studio "
-                       "(достаточно один раз запустить и остановить в нём виртуальную камеру).", "faint", wrap=True))
+        card.add(label("В Zoom, Teams, Discord, Telegram или браузере выберите камеру «Mimiq Camera». "
+                       "«Авто» использует её, а если она не установлена — OBS Virtual Camera.", "faint", wrap=True))
         col.addWidget(card)
 
         card = Card("Метка «AI»", "shield")
@@ -392,6 +419,12 @@ class SettingsPanel(QFrame):
         card.add(FieldRow("Видеокарта", self._combo("gpu_device", [(i, f"GPU {i}") for i in range(4)])))
         self.provider_info = label("", "faint", wrap=True)
         card.add(self.provider_info)
+        self.trt_btn = QPushButton("Установить TensorRT (≈1,9 ГБ)")
+        self.trt_btn.setCursor(POINTER)
+        self.trt_btn.setToolTip("Откроется окно установщика. После установки перезапустите Mimiq.")
+        self.trt_btn.clicked.connect(self.installTensorrt.emit)
+        self.trt_btn.setVisible(False)
+        card.add(self.trt_btn)
         col.addWidget(card)
 
         card = Card("Папки", "folder")
@@ -416,15 +449,25 @@ class SettingsPanel(QFrame):
 
     def set_providers(self, available: Sequence[str], active: str, gpu_name: str = "") -> None:
         items = [("auto", "Авто")]
-        for key, text in (("cuda", "NVIDIA CUDA"), ("tensorrt", "NVIDIA TensorRT"), ("directml", "DirectML · AMD / Intel"),
-                          ("cpu", "CPU")):
+        for key, text in (("tensorrt", "NVIDIA TensorRT · быстрее"), ("cuda", "NVIDIA CUDA"),
+                          ("directml", "DirectML · AMD / Intel"), ("cpu", "CPU")):
             ok = key in available
-            items.append((key, text if ok else f"{text} — недоступно", ok))
+            if key == "tensorrt" and not ok and "cuda" not in available:
+                continue                                   # not an NVIDIA PC — don't tease
+            items.append((key, text if ok else f"{text} — не установлено" if key == "tensorrt"
+                          else f"{text} — недоступно", ok))
         self.provider_combo.set_items(items, self.s.execution_provider)
         label_ = models.PROVIDER_LABELS.get(active, active)
         info = f"Сейчас: {label_}" + (f" · {gpu_name}" if gpu_name else "")
         if active == "cpu":
             info += ". Для реального времени нужна видеокарта NVIDIA RTX (CUDA) или DirectML."
+        elif active == "tensorrt":
+            info += ". Первый запуск после смены модели — пара минут на оптимизацию, дальше сразу из кэша."
+        want_trt = "cuda" in available and "tensorrt" not in available and sys.platform == "win32"
+        if want_trt:
+            info += (". С TensorRT лицо обновляется заметно чаще (обычно в 1,5–3 раза) — нужна NVIDIA RTX / "
+                     "GTX 16xx.")
+        self.trt_btn.setVisible(want_trt)
         self.provider_info.setText(info)
 
     def set_auto_status(self, running: bool, labels: Sequence[str], exhausted: bool) -> None:
@@ -454,6 +497,30 @@ class SettingsPanel(QFrame):
             self.vcam_dot.set_color(theme.FAINT)
             self.vcam_text.setText("Запустится вместе с обработкой" if self.s.vcam_enabled else "Выключена")
             self.vcam_text.setStyleSheet("")
+
+    def set_mcam_state(self, supported: bool, installed: bool, busy: str = "", other: str = "") -> None:
+        """State of the Mimiq Camera box. `busy` = text shown while (un)installing."""
+        self._mcam_installed = installed
+        self.mcam_btn.setVisible(supported)
+        self.mcam_btn.setEnabled(not busy)
+        if busy:
+            self.mcam_sub.setText(busy)
+            return
+        if not supported:
+            self.mcam_sub.setText("Своя виртуальная камера Mimiq есть только в Windows.")
+        elif installed:
+            self.mcam_sub.setText("Установлена — выберите «Mimiq Camera» в списке камер приложения.")
+        else:
+            note = f" (сейчас вместо неё зарегистрирована «{other}»)" if other else ""
+            self.mcam_sub.setText("Своя камера Mimiq, OBS не нужен. Установка — один раз, Windows спросит права "
+                                  "администратора" + note + ".")
+        self.mcam_btn.setText("Удалить" if installed else "Установить")
+        self.mcam_btn.setObjectName("ghost" if installed else "primary")
+        self.mcam_btn.style().unpolish(self.mcam_btn)
+        self.mcam_btn.style().polish(self.mcam_btn)
+
+    def _on_mcam_button(self) -> None:
+        self.vcamSetup.emit("uninstall" if self._mcam_installed else "install")
 
     def refresh_model_marks(self) -> None:
         self.swapper_combo.set_items(model_items("swapper"), self.s.swapper_model)

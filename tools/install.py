@@ -2,7 +2,10 @@
 
     install.bat                 → full install / repair
     install.bat directml        → force a runtime: cuda | cuda12 | directml | cpu
+    install.bat tensorrt        → only add NVIDIA TensorRT acceleration (≈1.9 GB) to an existing install
     install.bat --no-models     → skip model download (Mimiq downloads them on first start)
+    install.bat --no-tensorrt   → don't offer TensorRT
+    install.bat --no-camera     → don't install the "Mimiq Camera" virtual camera
 """
 from __future__ import annotations
 
@@ -173,6 +176,154 @@ def ask(question: str, default: bool = True) -> bool:
     return ans in ("y", "yes", "д", "да")
 
 
+# ------------------------------------------------------------------ TensorRT
+TRT_INDEX = "https://pypi.nvidia.com"
+TRT_PACKAGES = {"cuda": "tensorrt-cu13-libs", "cuda12": "tensorrt-cu12-libs"}
+TRT_ALL = ("tensorrt-cu13-libs", "tensorrt-cu12-libs")
+
+TRT_PROBE = r'''
+import json, sys
+sys.path.insert(0, sys.argv[1])
+res = {"ok": False}
+try:
+    import numpy as np
+    from mimiq.core import models
+    rt = models.ort()
+    st = models.tensorrt_status()
+    res["status"] = st
+    if not st.get("ok"):
+        raise RuntimeError(st.get("reason") or "TensorRT недоступен")
+    from onnx import helper as h, numpy_helper as nh, TensorProto as T
+    w = nh.from_array(np.ones((4, 3, 3, 3), np.float32), "w")
+    g = h.make_graph([h.make_node("Conv", ["x", "w"], ["y"], pads=[1, 1, 1, 1])], "probe",
+                     [h.make_tensor_value_info("x", T.FLOAT, [1, 3, 16, 16])],
+                     [h.make_tensor_value_info("y", T.FLOAT, [1, 4, 16, 16])], [w])
+    m = h.make_model(g, opset_imports=[h.make_opsetid("", 13)])
+    m.ir_version = 8
+    so = rt.SessionOptions()
+    so.log_severity_level = 3
+    s = rt.InferenceSession(m.SerializeToString(), so, providers=["TensorrtExecutionProvider", "CPUExecutionProvider"])
+    y = s.run(None, {"x": np.ones((1, 3, 16, 16), np.float32)})[0]
+    res["active"] = s.get_providers()[0]
+    res["ok"] = res["active"] == "TensorrtExecutionProvider" and abs(float(y[0, 0, 8, 8]) - 27.0) < 1e-2
+    res["version"] = st.get("version", "")
+except Exception as exc:
+    res["error"] = f"{type(exc).__name__}: {exc}"
+print("PROBE" + json.dumps(res))
+'''
+
+
+def probe_tensorrt() -> dict:
+    try:
+        out = subprocess.run([PY, "-c", TRT_PROBE, str(ROOT)], capture_output=True, text=True, timeout=600,
+                             encoding="utf-8", errors="replace").stdout
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    for line in out.splitlines():
+        if line.startswith("PROBE"):
+            return json.loads(line[5:])
+    return {"ok": False, "error": out.strip()[-400:] or "нет ответа"}
+
+
+def current_runtime() -> str:
+    have = installed_dists()
+    if "onnxruntime-gpu" not in have:
+        return ""
+    return "cuda12" if have["onnxruntime-gpu"] == "1.26.0" else "cuda"
+
+
+def remove_tensorrt(keep: str = "") -> None:
+    extra = [d for d in TRT_ALL if d != keep and _has_dist(d)]
+    if extra:
+        say(f"  Удаляю ненужные библиотеки TensorRT: {', '.join(extra)}", "dim")
+        pip("uninstall", "-y", *extra, quiet=True)
+
+
+def install_tensorrt(runtime: str, gpus, interactive: bool = True) -> bool:
+    """Add TensorRT libraries matching the installed onnxruntime-gpu. Returns True when TensorRT works."""
+    from mimiq.core.models import ort_tensorrt_major
+    pkg = TRT_PACKAGES.get(runtime)
+    if not pkg:
+        say("  TensorRT нужен только для видеокарт NVIDIA — пропущено.", "dim")
+        remove_tensorrt()
+        return False
+    best = max((g.compute for g in gpus if g.vendor == "nvidia"), default=0.0)
+    if best and best < 7.5:
+        say("  TensorRT 10 требует NVIDIA RTX или GTX 16xx — на этой видеокарте остаётся CUDA.", "dim")
+        remove_tensorrt()
+        return False
+    major = ort_tensorrt_major()
+    if major is None:
+        say("  Эта сборка ONNX Runtime не поддерживает TensorRT — остаётся CUDA.", "warn")
+        return False
+    remove_tensorrt(keep=pkg)
+    import importlib.metadata as md
+    try:
+        have = md.version(pkg)
+    except md.PackageNotFoundError:
+        have = ""
+    if have.split(".")[0] == str(major):
+        say(f"  Уже установлено: {pkg} {have} — проверяю…", "dim")
+        res = probe_tensorrt()
+        if res.get("ok"):
+            say(f"  ✓ TensorRT {res.get('version', have)} работает", "ok")
+            return True
+        say("  Проверка не прошла — переустанавливаю.", "warn")
+    elif interactive:
+        say("  TensorRT ускоряет нейросети на NVIDIA RTX: лицо обновляется заметно чаще (обычно в 1,5–3 раза).")
+        say("  Скачивание ≈1,9 ГБ (≈2,3 ГБ на диске). При первом запуске Mimiq пару минут оптимизирует модели.", "dim")
+        if not ask("Установить TensorRT?"):
+            say("  Пропущено. Добавить позже: install.bat tensorrt", "dim")
+            return False
+    say(f"  Скачиваю {pkg} {major}.x с pypi.nvidia.com (≈1,9 ГБ, один раз)…", "dim")
+    rc = pip("install", "--upgrade", "--extra-index-url", TRT_INDEX, f"{pkg}>={major},<{major + 1}")
+    if rc != 0:
+        say("  Не удалось скачать TensorRT. Mimiq будет работать на CUDA. Повторить: install.bat tensorrt", "warn")
+        return False
+    res = probe_tensorrt()
+    if res.get("ok"):
+        say(f"  ✓ TensorRT {res.get('version', '')} работает", "ok")
+        return True
+    say("  ✗ TensorRT не запустился — Mimiq будет работать на CUDA.", "err")
+    detail = res.get("error") or f"активный провайдер: {res.get('active', '?')}"
+    say(f"    {detail[:400]}", "dim")
+    return False
+
+
+def tensorrt_only() -> int:
+    say()
+    say("  Mimiq · установка NVIDIA TensorRT", "acc")
+    runtime = current_runtime()
+    if not runtime:
+        say("  Сначала установите Mimiq с ускорением NVIDIA CUDA: запустите install.bat без параметров.", "err")
+        return 1
+    ok = install_tensorrt(runtime, select_runtime.nvidia_gpus(), interactive=False)
+    say()
+    if ok:
+        say("  ✓ Готово! Перезапустите Mimiq. В «Вывод → Вычисления» будет «NVIDIA TensorRT»;", "ok")
+        say("    первый запуск займёт несколько минут — Mimiq оптимизирует модели под вашу видеокарту.", "ok")
+    return 0 if ok else 1
+
+
+# ------------------------------------------------------------------ Mimiq Camera
+def install_camera() -> None:
+    if not WIN:
+        say("  Своя виртуальная камера есть только в Windows — пропущено.", "dim")
+        return
+    from mimiq.io import vcam_setup
+    if vcam_setup.is_installed():
+        say(f"  ✓ «{vcam_setup.CAMERA_NAME}» уже установлена", "ok")
+        return
+    say(f"  «{vcam_setup.CAMERA_NAME}» — своя виртуальная камера Mimiq для Zoom, Teams, Discord, Telegram. OBS не нужен.")
+    if not ask("Установить? Windows спросит разрешение администратора"):
+        say("  Пропущено. Установить позже: Mimiq → «Вывод» → «Установить».", "dim")
+        return
+    ok, msg = vcam_setup.run("install")
+    say(f"  {'✓' if ok else '✗'} {msg}", "ok" if ok else "warn")
+    if not ok:
+        say("  Можно установить позже в Mimiq: «Вывод» → «Установить».", "dim")
+
+
 def create_shortcuts() -> None:
     if not WIN:
         return
@@ -203,8 +354,10 @@ foreach ($dir in @([Environment]::GetFolderPath('Desktop'), [Environment]::GetFo
 
 
 def main(argv) -> int:
+    if "tensorrt" in argv:
+        return tensorrt_only()
     force = next((a for a in argv if a in select_runtime.RUNTIMES), None)
-    total = 4
+    total = 6
     say()
     say("  ███╗   ███╗██╗███╗   ███╗██╗ ██████╗ ", "acc")
     say("  ████╗ ████║██║████╗ ████║██║██╔═══██╗", "acc")
@@ -254,7 +407,15 @@ def main(argv) -> int:
         say("  Mimiq будет работать на процессоре — это очень медленно (около 1 кадра в секунду или меньше). Для реального времени нужна "
             "видеокарта, лучше NVIDIA RTX.", "warn")
 
-    step(3, total, "Нейросети (≈680 МБ, один раз)")
+    step(3, total, "Ускорение NVIDIA TensorRT (необязательно)")
+    if "--no-tensorrt" in argv:
+        say("  Пропущено", "dim")
+    elif res.get("ok"):
+        install_tensorrt(choice.runtime, choice.gpus)
+    else:
+        say("  Пропущено — сначала должна заработать CUDA.", "dim")
+
+    step(4, total, "Нейросети (≈680 МБ, один раз)")
     if "--no-models" in argv:
         say("  Пропущено — Mimiq скачает модели при первом запуске.", "dim")
     else:
@@ -263,7 +424,13 @@ def main(argv) -> int:
         if rc != 0:
             say("  Модели не скачались полностью — Mimiq докачает их при запуске.", "warn")
 
-    step(4, total, "Ярлыки")
+    step(5, total, "Виртуальная камера «Mimiq Camera»")
+    if "--no-camera" in argv:
+        say("  Пропущено", "dim")
+    else:
+        install_camera()
+
+    step(6, total, "Ярлыки")
     if "--no-shortcut" in argv:
         say("  Пропущено", "dim")
     else:
@@ -272,8 +439,7 @@ def main(argv) -> int:
     say()
     say("  ✓ Mimiq установлен!", "ok")
     say("  Запуск: ярлык «Mimiq» на рабочем столе или Mimiq.bat", "dim")
-    say("  Виртуальная камера: установите OBS Studio 28+ и один раз нажмите в нём «Запустить виртуальную камеру».",
-        "dim")
+    say("  Виртуальная камера: в Zoom, Teams, Discord или Telegram выберите «Mimiq Camera».", "dim")
     if WIN and "--no-launch" not in argv and ask("Запустить Mimiq сейчас?"):
         subprocess.Popen([str(Path(PY).with_name("pythonw.exe")), "-m", "mimiq"], cwd=str(ROOT),
                          creationflags=0x00000008)  # DETACHED_PROCESS
