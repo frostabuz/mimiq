@@ -94,7 +94,18 @@ class _EmptyState(QWidget):
                 btn.setText("  " + text if ic else text)
                 btn.setIcon(icons.icon(ic, "#FFFFFF" if btn is self.primary else theme.TEXT, 18) if ic else QIcon())
         self.hint.setText(hint)
-        self.hint.setVisible(bool(hint))
+        self._update_hint()
+
+    def set_hint_suppressed(self, on: bool) -> None:
+        """Hide the bottom hint line while notifications are shown over it."""
+        self._suppress_hint = on
+        self._update_hint()
+
+    def _update_hint(self) -> None:
+        # keep the space reserved, so the centred content does not jump when the hint hides
+        self.hint.setVisible(bool(self.hint.text()))
+        hidden = getattr(self, "_suppress_hint", False)
+        self.hint.setStyleSheet("color: transparent;" if hidden else "")
 
 
 class PreviewWidget(QWidget):

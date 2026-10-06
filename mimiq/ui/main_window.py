@@ -87,6 +87,7 @@ class MainWindow(QMainWindow):
         self.status = self._build_status()
         v.addWidget(self.status)
         self.toasts = ToastManager(root, bottom_margin=118)
+        self.toasts.activeChanged.connect(self.preview.empty.set_hint_suppressed)
 
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)

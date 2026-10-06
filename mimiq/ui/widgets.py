@@ -7,7 +7,7 @@ from PySide6.QtCore import (Property, QEasingCurve, QEvent, QObject, QPoint, QPr
                             QTimer, Signal)
 from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage, QPainter, QPainterPath,
                            QPen, QPixmap)
-from PySide6.QtWidgets import (QAbstractButton, QButtonGroup, QComboBox, QFrame, QGraphicsOpacityEffect, QHBoxLayout,
+from PySide6.QtWidgets import (QAbstractButton, QButtonGroup, QComboBox, QFrame, QHBoxLayout,
                                QLabel, QPushButton, QSizePolicy, QSlider, QToolButton, QVBoxLayout, QWidget)
 
 from . import icons, theme
@@ -541,16 +541,18 @@ GradientText = Wordmark     # old name
 
 # ====================================================================== toasts
 class _Toast(QFrame):
+    """A notification card. Always fully opaque: it slides in instead of fading, so whatever lies underneath
+    (preview hints, video labels) never shows through it."""
     COLORS = {"ok": theme.OK, "info": theme.ACCENT_HI, "warn": theme.WARN, "error": theme.BAD}
     ICONS = {"ok": "check", "info": "info", "warn": "info", "error": "close"}
+    SLIDE = 14
 
     def __init__(self, level: str, text: str, parent: QWidget):
         super().__init__(parent)
         self.text_value = text
         color = self.COLORS.get(level, theme.ACCENT_HI)
         self.setObjectName("toast")
-        self.setStyleSheet(f"#toast {{ background: {theme.CARD_HI}; border: 1px solid {theme.LINE_HI}; "
-                           f"border-radius: 6px; }}")
+        self.setStyleSheet("#toast QLabel { background: transparent; }")
         lay = QHBoxLayout(self)
         lay.setContentsMargins(12, 10, 16, 10)
         lay.setSpacing(10)
@@ -562,15 +564,36 @@ class _Toast(QFrame):
         msg = label(text, wrap=True)
         msg.setMaximumWidth(520)
         lay.addWidget(msg)
-        self.effect = QGraphicsOpacityEffect(self)
-        self.effect.setOpacity(0.0)
-        self.setGraphicsEffect(self.effect)
-        self.anim = QPropertyAnimation(self.effect, b"opacity", self)
-        self.anim.setDuration(220)
+        self.target = QPoint()
+        self.anim = QPropertyAnimation(self, b"pos", self)
+        self.anim.setDuration(180)
+        self.anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+    def paintEvent(self, e):  # noqa: N802
+        # opaque card with rounded corners, painted by hand (independent of the style sheet engine)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(QColor(theme.LINE_HI), 1))
+        p.setBrush(QColor(theme.CARD_HI))
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 6, 6)
+
+    def slide_to(self, target: QPoint, appear: bool = False) -> None:
+        self.target = target
+        if appear:
+            self.move(target.x(), target.y() + self.SLIDE)
+        elif self.anim.state() != QPropertyAnimation.State.Running and self.pos() == target:
+            return
+        self.anim.stop()
+        self.anim.setStartValue(self.pos())
+        self.anim.setEndValue(target)
+        self.anim.start()
 
 
 class ToastManager(QObject):
-    """Stacks toasts at the bottom centre of a host widget."""
+    """Stacks toasts at the bottom centre of a host widget. `activeChanged` tells the UI when toasts are on screen
+    (the preview hides its bottom hint line then, so the two never overlap)."""
+
+    activeChanged = Signal(bool)
 
     def __init__(self, host: QWidget, bottom_margin: int = 64):
         super().__init__(host)
@@ -587,17 +610,17 @@ class ToastManager(QObject):
     def show(self, level: str, text: str, timeout: int = 3800) -> None:
         if any(t.text_value == text for t in self.toasts):
             return  # identical toast already visible
+        was_empty = not self.toasts
         t = _Toast(level, text, self.host)
         t.adjustSize()
-        t.show()
-        t.raise_()
         self.toasts.append(t)
         if len(self.toasts) > 3:
             self._close(self.toasts[0])
-        self._layout()
-        t.anim.setStartValue(0.0)
-        t.anim.setEndValue(1.0)
-        t.anim.start()
+        if was_empty:
+            self.activeChanged.emit(True)
+        self._layout(new=t)
+        t.show()
+        t.raise_()
         QTimer.singleShot(timeout, lambda: self._close(t))
 
     def _close(self, t: _Toast) -> None:
@@ -605,16 +628,16 @@ class ToastManager(QObject):
             return
         self.toasts.remove(t)
         t.anim.stop()
-        t.anim.setStartValue(t.effect.opacity())
-        t.anim.setEndValue(0.0)
-        t.anim.finished.connect(t.deleteLater)
-        t.anim.start()
+        t.hide()            # gone at once — a half-transparent card over other text looks broken
+        t.deleteLater()
         self._layout()
+        if not self.toasts:
+            self.activeChanged.emit(False)
 
-    def _layout(self) -> None:
+    def _layout(self, new: Optional[_Toast] = None) -> None:
         y = self.host.height() - self.bottom
         for t in reversed(self.toasts):
             t.adjustSize()
             y -= t.height()
-            t.move((self.host.width() - t.width()) // 2, y)
+            t.slide_to(QPoint((self.host.width() - t.width()) // 2, y), appear=t is new)
             y -= 8
