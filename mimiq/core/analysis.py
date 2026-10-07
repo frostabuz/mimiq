@@ -11,8 +11,16 @@ import cv2
 import numpy as np
 
 from . import geometry as geo
+from .landmarks import five_from_68
 
 log = logging.getLogger("mimiq.analysis")
+
+
+def enhance_contrast(img: np.ndarray, clip: float = 2.0) -> np.ndarray:
+    """CLAHE on lightness only — reveals faces in shadow without shifting colours."""
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    lab[:, :, 0] = cv2.createCLAHE(clipLimit=clip, tileGridSize=(4, 4)).apply(lab[:, :, 0])
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
 
 # --------------------------------------------------------------------------------------
@@ -92,12 +100,29 @@ class FaceDetector:
         dets.sort(key=lambda d: d.score, reverse=True)
         return dets
 
+    def detect_all(self, image: np.ndarray, size: int = 640, threshold: float = 0.5,
+                   multi: bool = False) -> List[Detection]:
+        """Full-frame search that also finds faces right in front of the camera: at 640 px the network's
+        largest anchors are smaller than a face that fills the frame, so a coarse 320 px pass covers them."""
+        dets = self.detect(image, size, threshold)
+        if size > 320 and (not dets or multi):
+            short = min(image.shape[:2])
+            big = [d for d in self.detect(image, 320, threshold) if d.size > 0.35 * short]
+            for d in big:
+                if all(geo.iou(d.box, o.box) < 0.3 for o in dets):
+                    dets.append(d)
+            dets.sort(key=lambda d: d.score, reverse=True)
+        return dets
+
     def detect_roi(self, frame: np.ndarray, center, side: float, angle: float, size: int = 320,
-                   threshold: float = 0.35) -> List[Detection]:
+                   threshold: float = 0.35, retry: bool = True) -> List[Detection]:
         """Detect inside a rotated square ROI (keeps tilted heads upright for the detector)."""
         m = geo.similarity_roi(center, side, angle, size)
         crop = cv2.warpAffine(frame, m, (size, size), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
         dets = self.detect(crop, size=size, threshold=threshold)
+        if not dets and retry:
+            # second chance with local contrast: shadow of a cap visor, backlight, dark room
+            dets = self.detect(enhance_contrast(crop), size=size, threshold=threshold)
         inv = geo.invert(m)
         out = []
         for d in dets:
@@ -119,25 +144,30 @@ class Landmarker68:
         self.swap_rb = swap_rb
 
     def detect(self, frame: np.ndarray, box: np.ndarray, angle: float = 0.0) -> Tuple[np.ndarray, float]:
+        pts, score, _ = self.detect_full(frame, box, angle)
+        return pts, score
+
+    def detect_full(self, frame: np.ndarray, box: np.ndarray,
+                    angle: float = 0.0) -> Tuple[np.ndarray, float, np.ndarray]:
+        """68 points, overall score and per-point heat-map confidence."""
         cx, cy = (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
         side = max(box[2] - box[0], box[3] - box[1]) * 256.0 / 195.0
         m = geo.similarity_roi((cx, cy), side, angle, 256)
         crop = cv2.warpAffine(frame, m, (256, 256), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
         if float(crop.mean()) < 40:  # boost contrast for dark scenes
-            lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
-            lab[:, :, 0] = cv2.createCLAHE(clipLimit=2.0).apply(lab[:, :, 0])
-            crop = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+            crop = enhance_contrast(crop)
         x = crop[..., ::-1] if self.swap_rb else crop
         x = (x.astype(np.float32) / 255.0).transpose(2, 0, 1)[None]
         lms, heat = self.session.run(None, {self.input_name: x})
         pts = lms[0, :, :2] / 64.0 * 256.0
         pts = geo.transform_points(pts, geo.invert(m))
-        score = float(np.interp(float(np.mean(np.amax(heat[0], axis=(1, 2)))), [0, 0.9], [0, 1]))
-        return pts, score
+        conf = np.amax(heat[0].reshape(heat.shape[1], -1), axis=1).astype(np.float64)
+        score = float(np.interp(float(np.mean(conf)), [0, 0.9], [0, 1]))
+        return pts, score, conf
 
     @staticmethod
     def to_five(lm68: np.ndarray) -> np.ndarray:
-        return np.array([lm68[36:42].mean(0), lm68[42:48].mean(0), lm68[30], lm68[48], lm68[54]], np.float64)
+        return five_from_68(lm68)
 
 
 # --------------------------------------------------------------------------------------

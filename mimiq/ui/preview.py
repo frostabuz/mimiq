@@ -433,6 +433,8 @@ class PreviewWidget(QWidget):
             status, color = "Удержание…", theme.WARN
         elif len(self._faces) > 1:
             status, color = f"Лиц в кадре: {len(self._faces)}", theme.DIM
+        elif self._faces[0].get("status") == "covered":
+            status, color = "Лицо частично закрыто", theme.DIM
         else:
             status, color = "Лицо в кадре", theme.DIM
         parts = []
@@ -446,6 +448,10 @@ class PreviewWidget(QWidget):
         h = 28.0
         self._pill(p, QPointF(r.left() + m, r.bottom() - m - h), parts,
                    avatar=self._identity_avatar if active else None, height=h)
+        if self._mode == "mask" and r.width() >= 640:
+            legend = [("●", "#3D8BFD"), (" заменяется     ", theme.DIM), ("●", "#FFB040"),
+                      (" закрыто — остаётся с камеры     ", theme.DIM), ("●", "#F0F4FA"), (" точки лица", theme.DIM)]
+            self._pill(p, QPointF(r.right() - m, r.bottom() - m - h), legend, anchor="right", height=h)
 
     def _paint_loading(self, p: QPainter) -> None:
         stage, frac, text = self._loading

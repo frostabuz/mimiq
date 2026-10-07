@@ -25,7 +25,7 @@ from PySide6.QtCore import QObject, Signal
 
 from . import paths
 from .config import Settings
-from .core import models
+from .core import maskview, models
 from .core.background import BackgroundCompositor, BackgroundMatter, Matte
 from .core.identity import Identity, IdentityLibrary
 from .core.pipeline import FrameJob, FrameResult, Pipeline
@@ -45,7 +45,6 @@ OUTPUT_KEYS = {"vcam_enabled", "vcam_backend", "output_width", "output_height", 
 LINK_KEYS = {"link_resolution", "link_fps", "link_quality", "link_camera"}
 QUALITY_KEYS = {"swap_passes", "pixel_boost", "enhancer_model", "enhancer_blend", "mask_region", "landmark_refine",
                 "mask_occlusion", "swapper_model", "auto_quality", "preset"}
-ACCENT_BGR = np.array([253, 139, 61], np.float32)   # #3D8BFD
 FLUID_FACE_FPS = 15.0      # in fluid mode the face render aims for this many updates per second
 PART_KEYS = ("swap", "enhance", "parser", "landmarks", "occlusion")
 BG_KEYS = {"bg_mode", "bg_model"}
@@ -731,11 +730,13 @@ class Engine(QObject):
         view = out
         if mode in ("split", "original"):
             original = self._fit_preview(fit_frame(frame, s.output_width, s.output_height, s.output_fit))
-        if mode == "mask" and res.mask is not None:
-            m = fit_frame((res.mask * 255).astype(np.uint8)[..., None].repeat(3, 2), s.output_width,
-                          s.output_height, s.output_fit)[..., 0].astype(np.float32)[..., None] / 255.0
-            base = fit_frame(frame, s.output_width, s.output_height, s.output_fit).astype(np.float32) * 0.5
-            view = np.clip(base * (1 - 0.55 * m) + ACCENT_BGR * 0.55 * m + 255 * 0.1 * m, 0, 255).astype(np.uint8)
+        if mode == "mask":
+            try:
+                pad = (s.mask_padding_top, s.mask_padding_sides, s.mask_padding_bottom, s.mask_padding_sides)
+                view = maskview.render(frame, res.marks, (s.output_width, s.output_height), s.output_fit,
+                                       self.preview_size, s.mask_blur, pad)
+            except Exception as exc:   # a debug view must never stop the video
+                log.debug("mask view failed: %s", exc)
         view = self._fit_preview(view)
         self._preview_busy = True
         self.frameReady.emit({"result": to_qimage(view), "original": to_qimage(original) if original is not None else None})

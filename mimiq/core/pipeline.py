@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -32,6 +32,8 @@ from . import models
 from .analysis import (FaceDetector, FaceEnhancer, FaceParser, FaceRecognizer, FaceSwapper, Landmarker68, Occluder,
                        apply_color_transfer, box_mask, lab_stats)
 from .identity import Identity, IdentityBuilder
+from .landmarks import shape_from_five
+from .maskview import FaceMarks
 from .tracker import FaceTracker, TrackerConfig
 
 log = logging.getLogger("mimiq.pipeline")
@@ -73,6 +75,7 @@ class FrameJob:
     seq: int = 0                # set by the engine
     ts: float = 0.0             # capture time (set by the engine)
     matte: Optional[object] = None   # background matte of this frame (set by the engine)
+    marks: Dict[int, FaceMarks] = field(default_factory=dict)   # tracked points (mask view only)
 
 
 @dataclass
@@ -82,6 +85,7 @@ class FrameResult:
     timings: Dict[str, float] = field(default_factory=dict)
     mask: Optional[np.ndarray] = None   # full-frame mask (debug view)
     swapped: bool = False               # a face was rendered by stage B for this very frame
+    marks: List[FaceMarks] = field(default_factory=list)   # mask view: points + face-space masks
 
 
 @dataclass
@@ -279,6 +283,12 @@ class Pipeline:
             job.faces = [FaceInfo(tr.id, [float(v) for v in tr.box], tr.status, float(tr.alpha), float(tr.score))
                          for tr in tracks]
             job.lite = [(tr.id, tr.lm5.copy(), float(tr.alpha)) for tr in tracks]
+            if job.want_mask:
+                for tr in tracks:
+                    approx = tr.lm68 is None
+                    lm68 = shape_from_five(tr.lm5) if approx else tr.lm68.copy()
+                    hidden = None if tr.hidden is None else tr.hidden.copy()
+                    job.marks[tr.id] = FaceMarks(tr.id, float(tr.alpha), lm68, hidden, approx)
             sw, ident = self.swapper, self.identity
             if not (prepare and tracks and self.swap_active(s)):
                 job.timings["analyze"] = (time.perf_counter() - t0) * 1000
@@ -292,6 +302,7 @@ class Pipeline:
                 if heavy:
                     o0 = time.perf_counter()
                     fj.occlusion = self._occlusion(tr.state, crop, s)
+                    self._hint(tr.id, fj.occlusion, m, t)
                     occ_ms += (time.perf_counter() - o0) * 1000
                     fj.latent = self._latent(tr.state, frame, tr.lm5, tr.visible_now, s, t, sw, ident)
                 else:
@@ -301,6 +312,12 @@ class Pipeline:
                 job.timings["occlusion"] = occ_ms
             job.timings["analyze"] = (time.perf_counter() - t0) * 1000
             return job
+
+    def _hint(self, tid: int, mask: Optional[np.ndarray], matrix: np.ndarray, t: float) -> None:
+        """Hand the occlusion mask to the tracker: landmarks under a hand / mask / mic are then not trusted."""
+        tracker = self.tracker
+        if tracker is not None and mask is not None:
+            tracker.hints[tid] = (mask, matrix, t)
 
     def _occlusion(self, st: dict, crop: np.ndarray, s: Settings) -> Optional[np.ndarray]:
         if self.occluder is None or not s.mask_occlusion:
@@ -343,6 +360,7 @@ class Pipeline:
         res = FrameResult(frame=job.frame, faces=job.faces, timings=dict(job.timings))
         full = np.zeros(job.frame.shape[:2], np.float32) if job.want_mask else None
         res.mask = full
+        res.marks = list(job.marks.values())
         if not job.lite or not self.swap_active(s):
             return res
         t0 = time.perf_counter()
@@ -361,6 +379,9 @@ class Pipeline:
             geo.paste(out, c.face, mask, m)
             if full is not None:
                 geo.paste_mask(full, mask, m)
+                mk = job.marks.get(tid)
+                if mk is not None:
+                    res.marks = [replace(x, matrix=m, mask=mask) if x is mk else x for x in res.marks]
         if out is not None:
             res.frame = out
         res.timings["compose"] = (time.perf_counter() - t0) * 1000
@@ -373,6 +394,7 @@ class Pipeline:
             res = FrameResult(frame=job.frame, faces=job.faces, timings=dict(job.timings))
             full_mask = np.zeros(job.frame.shape[:2], np.float32) if job.want_mask else None
             res.mask = full_mask
+            res.marks = list(job.marks.values())
             self._prune(job)
             sw, ident = self.swapper, self.identity
             if not job.jobs or sw is None or ident is None:
@@ -389,6 +411,7 @@ class Pipeline:
                 if fj.need_occlusion:
                     p0 = time.perf_counter()
                     fj.occlusion = self._occlusion(st, fj.crop, s)
+                    self._hint(fj.tid, fj.occlusion, fj.matrix, job.t)
                     acc["occlusion"] = acc.get("occlusion", 0.0) + (time.perf_counter() - p0) * 1000
                 if fj.latent is None:
                     p0 = time.perf_counter()
@@ -396,6 +419,9 @@ class Pipeline:
                     acc["identity"] = acc.get("identity", 0.0) + (time.perf_counter() - p0) * 1000
                 final, mask = self._render_one(out, fj, s, acc, full_mask, job.t, st)
                 done.append((fj, final, mask))
+                mk = job.marks.get(fj.tid)
+                if mk is not None:
+                    res.marks = [replace(x, matrix=fj.matrix, mask=final) if x is mk else x for x in res.marks]
                 if primary is None or fj.alpha > primary.alpha:
                     primary = fj
             c0 = time.perf_counter()
