@@ -37,7 +37,7 @@ PRESET_TIPS = {
     "ultra": "Как «Качество» + 2 прохода замены (больше сходства) — для RTX 4070 и выше",
 }
 STAGE_NAMES = (("track", "трекинг"), ("swap", "замена"), ("enhance", "улучшение"), ("occlusion", "перекрытия"),
-               ("parser", "форма"))
+               ("parser", "форма"), ("background", "фон"))
 
 
 class _Bridge(QObject):
@@ -177,7 +177,11 @@ class MainWindow(QMainWindow):
         self.vcam_toggle = ToggleSwitch()
         self.vcam_toggle.toggled.connect(lambda on: self.update_settings({"vcam_enabled": on}))
         self.vcam_label = label("Вирт. камера")
+        self.bg_toggle = ToggleSwitch()
+        self.bg_toggle.toggled.connect(self._toggle_background)
+        self.bg_label = label("Фон")
         for ic, lab, tog, tip in (("face", self.swap_label, self.swap_toggle, "Замена лица (Ctrl+E)"),
+                                  ("image", self.bg_label, self.bg_toggle, "Размытие или замена фона (Ctrl+B)"),
                                   ("monitor", self.vcam_label, self.vcam_toggle, "Отправлять видео в виртуальную камеру")):
             box = QHBoxLayout()
             box.setSpacing(8)
@@ -260,11 +264,13 @@ class MainWindow(QMainWindow):
         self.settings_panel.vcamSetup.connect(self._vcam_setup)
         self.settings_panel.installTensorrt.connect(self._install_tensorrt)
         self.settings_panel.checkUpdates.connect(lambda: self.check_updates(manual=True))
+        self.settings_panel.notify.connect(lambda lvl, txt: self.toasts.show(lvl, txt))
         self._bridge.update.connect(self._on_update)
 
     def _shortcuts(self) -> None:
         for seq, fn in (("Space", self.toggle_run), ("F11", self.toggle_fullscreen), ("Ctrl+S", self.snapshot),
                         ("Ctrl+R", self.toggle_record), ("Ctrl+E", lambda: self.swap_toggle.toggle()),
+                        ("Ctrl+B", lambda: self.bg_toggle.toggle()),
                         ("Ctrl+1", lambda: self._set_mode("result")), ("Ctrl+2", lambda: self._set_mode("split")),
                         ("Ctrl+3", lambda: self._set_mode("original")), ("Ctrl+4", lambda: self._set_mode("mask")),
                         ("Ctrl+H", lambda: self.update_settings({"show_hud": not self.settings.show_hud})),
@@ -280,6 +286,7 @@ class MainWindow(QMainWindow):
         self.mode_seg.set_value(s.preview_mode)
         self.swap_toggle.set_value(s.swap_enabled)
         self.vcam_toggle.set_value(s.vcam_enabled)
+        self.bg_toggle.set_value(s.bg_mode != "off")
         self.preview.set_mode(s.preview_mode)
         self.preview.set_swap_enabled(s.swap_enabled)
         self.preview.set_show_hud(s.show_hud)
@@ -329,6 +336,10 @@ class MainWindow(QMainWindow):
         if "vcam_enabled" in ch:
             self.vcam_toggle.set_value(new.vcam_enabled)
             self._update_vcam_chip(self.engine.vcam.active, "")
+        if "bg_mode" in ch:
+            self.bg_toggle.set_value(new.bg_mode != "off")
+            if new.bg_mode != "off" and new.bg_last != new.bg_mode:
+                new.bg_last = new.bg_mode
         if "show_hud" in ch:
             self.preview.set_show_hud(new.show_hud)
         if "source_kind" in ch:
@@ -347,6 +358,12 @@ class MainWindow(QMainWindow):
         if "vcam_enabled" in ch:
             self.settings_panel.set_vcam_status(self.engine.vcam.active, "")
         self._save_timer.start()
+
+    def _toggle_background(self, on: bool) -> None:
+        s = self.settings
+        if on == (s.bg_mode != "off"):
+            return
+        self.update_settings({"bg_mode": (s.bg_last or "blur") if on else "off"})
 
     def apply_preset(self, key: str) -> None:
         if key not in PRESETS:
@@ -830,9 +847,9 @@ class MainWindow(QMainWindow):
         self.faces.setFixedWidth(256 if narrow else 288)
         self.settings_panel.setFixedWidth(340 if narrow else 368)
         center = w - self.faces.width() - self.settings_panel.width() - 56
-        roomy = center >= 930
-        self.swap_label.setVisible(roomy)
-        self.vcam_label.setVisible(roomy)
+        roomy = center >= 1000
+        for lab in (self.swap_label, self.bg_label, self.vcam_label):
+            lab.setVisible(roomy)
         super().resizeEvent(e)
 
     def closeEvent(self, e):  # noqa: N802

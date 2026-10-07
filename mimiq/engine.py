@@ -26,6 +26,7 @@ from PySide6.QtCore import QObject, Signal
 from . import paths
 from .config import Settings
 from .core import models
+from .core.background import BackgroundCompositor, BackgroundMatter, Matte
 from .core.identity import Identity, IdentityLibrary
 from .core.pipeline import FrameJob, FrameResult, Pipeline
 from .core.tuner import AutoTuner, rate_text
@@ -47,6 +48,7 @@ QUALITY_KEYS = {"swap_passes", "pixel_boost", "enhancer_model", "enhancer_blend"
 ACCENT_BGR = np.array([253, 139, 61], np.float32)   # #3D8BFD
 FLUID_FACE_FPS = 15.0      # in fluid mode the face render aims for this many updates per second
 PART_KEYS = ("swap", "enhance", "parser", "landmarks", "occlusion")
+BG_KEYS = {"bg_mode", "bg_model"}
 
 
 class Engine(QObject):
@@ -117,6 +119,11 @@ class Engine(QObject):
         self.watermark: Optional[np.ndarray] = None
         self.placeholder: Optional[np.ndarray] = None
         self._pending_settings: Optional[Settings] = None
+        self.matter: Optional[BackgroundMatter] = None     # background matting (loaded on demand)
+        self.bgc = BackgroundCompositor()
+        self._bg_job: Optional[threading.Thread] = None
+        self._bg_on = False
+        self._bg_msg = ""
         self.link_source.on_status = lambda st, msg: self.sourceStatus.emit(st, msg)
 
     # ================================================================== boot / models
@@ -169,6 +176,8 @@ class Engine(QObject):
                 if trt:
                     self.hub.prime(key)
                 self.modelProgress.emit("load", (i + 1) / len(keys), f"Загрузка {title}…")
+            if s.bg_mode != "off":
+                self._make_matter(s.bg_model)
             failed = self.hub.trt_failed
             if failed:
                 names = ", ".join(models.REGISTRY[k].title for k in failed)
@@ -193,6 +202,93 @@ class Engine(QObject):
             self.modelProgress.emit("error", 0.0, str(exc))
             self.message.emit("error", f"Ошибка загрузки моделей: {exc}")
             self.modelsReady.emit(False)
+
+    # ================================================================== background
+    def _make_matter(self, key: str) -> None:
+        sess = self.hub.get(key)
+        m = self.matter
+        if m is not None and m.key == key and m.session is sess:
+            return
+        m = BackgroundMatter(key, sess)
+        try:
+            m.warmup()
+        except Exception as exc:
+            log.warning("background warm-up failed: %s", exc)
+        self.matter = m
+        log.info("background matting ready: %s", key)
+
+    def _ensure_matter(self, s: Settings) -> None:
+        """Download / load the matting model when the background is switched on (never blocks the video)."""
+        if s.bg_mode == "off":
+            return
+        m = self.matter
+        if m is not None and m.key == s.bg_model:
+            return
+        if self._bg_job is not None and self._bg_job.is_alive():
+            return                                  # the running job re-checks the wanted model when done
+        self._bg_job = threading.Thread(target=self._bg_job_main, args=(s.bg_model,), daemon=True, name="mimiq-bg")
+        self._bg_job.start()
+
+    def _bg_job_main(self, key: str) -> None:
+        spec = models.REGISTRY[key]
+        try:
+            if not models.is_installed(key):
+                def progress(_k, done, size, speed):
+                    self.modelProgress.emit("download", done / max(size, 1),
+                                            f"Скачивание {spec.title} · {done / 1e6:.0f}/{size / 1e6:.0f} МБ · "
+                                            f"{speed / 1e6:.1f} МБ/с")
+                try:
+                    models.download(key, progress, self._cancel_dl)
+                finally:
+                    self.modelProgress.emit("done", 1.0, "Готово")
+            self._make_matter(key)
+        except models.DownloadCancelled:
+            return
+        except Exception as exc:
+            log.exception("background model failed")
+            self.message.emit("error", f"Не удалось подготовить замену фона: {exc}")
+            return
+        s = self.settings
+        if s.bg_mode != "off" and s.bg_model != key:
+            self._bg_job = None
+            self._ensure_matter(s)
+
+    def _matte(self, frame: np.ndarray, s: Settings) -> Optional[Matte]:
+        m = self.matter
+        on = s.bg_mode != "off" and m is not None
+        if on and not self._bg_on and m is not None:
+            m.reset()                               # fresh recurrent state after the background was off
+        self._bg_on = on
+        if not on:
+            return None
+        t0 = time.monotonic()
+        try:
+            mt = m.matte(frame, s.bg_stability)
+        except Exception as exc:
+            log.exception("background matting failed")
+            self.matter = None
+            self.message.emit("error", f"Замена фона остановлена: {exc}")
+            return None
+        self._record({"background": (time.monotonic() - t0) * 1000}, ("background",))
+        return mt
+
+    def _apply_background(self, img: np.ndarray, frame: np.ndarray, matte: Optional[Matte], s: Settings) -> np.ndarray:
+        if matte is None or s.bg_mode == "off" or matte.size != (frame.shape[1], frame.shape[0]):
+            return img
+        try:
+            out = self.bgc.apply(img, frame, matte, s.bg_mode, blur=s.bg_blur, image=s.bg_image,
+                                 image_blur=s.bg_image_blur, color=s.bg_color)
+        except Exception as exc:
+            if str(exc) != self._bg_msg:
+                self._bg_msg = str(exc)
+                log.exception("background compositing failed")
+                self.message.emit("error", f"Ошибка замены фона: {exc}")
+            return img
+        err = self.bgc.image_error if s.bg_mode == "image" else None
+        if err and err != self._bg_msg:
+            self.message.emit("warn", f"{err} — пока размываю фон. Выберите картинку во вкладке «Фон».")
+        self._bg_msg = err or ""
+        return out
 
     def reload_models(self) -> None:
         """Retry model download/loading (e.g. after a network error)."""
@@ -224,6 +320,8 @@ class Engine(QObject):
             self.tuner.reset()                      # an explicit choice: start from what the user asked for
         if changed & MODEL_KEYS:
             self._load_models(new.copy())
+        if changed & BG_KEYS:
+            self._ensure_matter(new)
         self._push_effective()
         self.pipeline.want_mask = new.preview_mode == "mask"
         if changed & SOURCE_KEYS and self.running:
@@ -344,6 +442,8 @@ class Engine(QObject):
         self.pipeline.reset_tracking()
         self.pipeline.clear_cache()
         self._reset_run_state()
+        if self.matter is not None:
+            self.matter.reset()
         self._threads = [threading.Thread(target=self._analyze_loop, daemon=True, name="mimiq-analyse"),
                          threading.Thread(target=self._render_loop, daemon=True, name="mimiq-render"),
                          threading.Thread(target=self._output_loop, daemon=True, name="mimiq-output")]
@@ -394,6 +494,8 @@ class Engine(QObject):
             old.stop()
         self.source.start()
         self.pipeline.reset_tracking()
+        if self.matter is not None:
+            self.matter.reset()
 
     def shutdown(self) -> None:
         self._cancel_dl.set()
@@ -512,28 +614,29 @@ class Engine(QObject):
             frame = orient(frame, s.rotate, s.mirror)
             self._seq += 1
             n = self._seq
+            matte = self._matte(frame, s)
             if not ready:
-                self._publish(n, FrameResult(frame), frame, s, ts)
+                self._publish(n, FrameResult(frame), frame, s, ts, matte)
                 self._maybe_stats()
                 continue
             try:
                 prepare = not fluid or (self._slot is None and not self._b_busy)
                 job = self.pipeline.analyze(frame, t0, prepare=prepare, heavy=not fluid)
-                job.seq, job.ts = n, ts
+                job.seq, job.ts, job.matte = n, ts, matte
                 if job.jobs:
                     with self._slot_cond:
                         self._slot = job
                         self._slot_cond.notify_all()
                 if fluid or not job.jobs:
                     res = self.pipeline.compose(job)
-                    self._publish(n, res, frame, s, ts)
+                    self._publish(n, res, frame, s, ts, matte)
                     self._record(res.timings, ("track", "landmarks", "occlusion", "compose"))
                 else:
                     self._record(job.timings, ("track", "landmarks", "occlusion"))
                 self._last_error = ""
             except Exception as exc:
                 self._report_error(exc)
-                self._publish(n, FrameResult(frame), frame, s, ts)
+                self._publish(n, FrameResult(frame), frame, s, ts, matte)
             dt = (time.monotonic() - t0) * 1000
             self._a_ms = dt if self._a_ms <= 0 else 0.85 * self._a_ms + 0.15 * dt
             self._tune()
@@ -558,7 +661,7 @@ class Engine(QObject):
             except Exception as exc:
                 self._report_error(exc)
                 res = FrameResult(job.frame, job.faces, dict(job.timings))
-            self._publish(job.seq, res, job.frame, job.settings, job.ts)
+            self._publish(job.seq, res, job.frame, job.settings, job.ts, job.matte)
             now = time.monotonic()
             dt = (now - t0) * 1000
             if res.swapped:
@@ -585,11 +688,13 @@ class Engine(QObject):
                 self._timings.setdefault(k, deque(maxlen=30)).append(v)
 
     # ================================================================== publishing
-    def _publish(self, seq: int, res: FrameResult, frame: np.ndarray, s: Settings, ts: float) -> bool:
+    def _publish(self, seq: int, res: FrameResult, frame: np.ndarray, s: Settings, ts: float,
+                 matte: Optional[Matte] = None) -> bool:
         """Make `res` the current output frame unless a newer frame was already published."""
         if seq <= self._pub_seq:
             return False
-        out = fit_frame(res.frame, s.output_width, s.output_height, s.output_fit)
+        img = self._apply_background(res.frame, frame, matte, self.settings)
+        out = fit_frame(img, s.output_width, s.output_height, s.output_fit)
         if s.watermark and self.watermark is not None:
             if out is res.frame or out is frame:
                 out = out.copy()

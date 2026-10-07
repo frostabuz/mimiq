@@ -72,6 +72,7 @@ class FrameJob:
     want_mask: bool = False
     seq: int = 0                # set by the engine
     ts: float = 0.0             # capture time (set by the engine)
+    matte: Optional[object] = None   # background matte of this frame (set by the engine)
 
 
 @dataclass

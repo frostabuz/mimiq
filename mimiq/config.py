@@ -75,6 +75,15 @@ class Settings:
     output_fps: int = 30
     output_fit: str = "crop"             # crop | fit
     watermark: bool = True
+    # ---- background --------------------------------------------------------------------
+    bg_mode: str = "off"                 # off | blur | image | color
+    bg_last: str = "blur"                # last non-off mode (quick toggle)
+    bg_model: str = "rvm_mobilenetv3"    # rvm_mobilenetv3 | rvm_resnet50
+    bg_blur: float = 0.6
+    bg_image: str = ""
+    bg_image_blur: float = 0.0
+    bg_color: str = "#202024"
+    bg_stability: float = 0.6            # calms the edge between frames 0..1
     # ---- performance -----------------------------------------------------------------
     execution_provider: str = "auto"
     gpu_device: int = 0
@@ -126,6 +135,12 @@ class Settings:
                         setattr(s, k, v)
                 if int(data.get("settings_version", 1)) < SETTINGS_VERSION:
                     s.migrate(int(data.get("settings_version", 1)))
+                if s.bg_mode not in ("off", "blur", "image", "color"):
+                    s.bg_mode = "off"
+                if s.bg_last not in ("blur", "image", "color"):
+                    s.bg_last = "blur"
+                if s.bg_model not in ("rvm_mobilenetv3", "rvm_resnet50"):
+                    s.bg_model = "rvm_mobilenetv3"
                 if s.vcam_backend not in ("auto", "mimiq", "obs"):
                     s.vcam_backend = "mimiq" if s.vcam_backend == "unitycapture" else "auto"
             except Exception as exc:
@@ -154,6 +169,8 @@ class Settings:
             keys.append(self.occluder_model)
         if self.mask_region:
             keys.append(self.parser_model)
+        if self.bg_mode != "off":
+            keys.append(self.bg_model)
         return keys
 
 

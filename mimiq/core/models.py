@@ -17,6 +17,7 @@ log = logging.getLogger("mimiq.models")
 
 HF = "https://huggingface.co/facefusion/{repo}/resolve/main/{file}"
 GH = "https://github.com/facefusion/facefusion-assets/releases/download/{repo}/{file}"
+RVM = "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/{file}"
 
 
 @dataclass(frozen=True)
@@ -28,9 +29,12 @@ class ModelSpec:
     kind: str
     title: str
     note: str = ""
+    url: str = ""                 # own download address (models that are not in the FaceFusion assets)
 
     @property
     def urls(self) -> List[str]:
+        if self.url:
+            return [self.url]
         return [HF.format(repo=self.repo, file=self.file), GH.format(repo=self.repo, file=self.file)]
 
     @property
@@ -72,6 +76,13 @@ _SPECS = [
     ModelSpec("xseg_3", "xseg_3.onnx", "models-3.2.0", 70327709, "occluder", "XSeg 3"),
     ModelSpec("bisenet_resnet_18", "bisenet_resnet_18.onnx", "models-3.1.0", 53205356, "parser", "BiSeNet R18"),
     ModelSpec("bisenet_resnet_34", "bisenet_resnet_34.onnx", "models-3.0.0", 93632546, "parser", "BiSeNet R34"),
+    # background matting (Robust Video Matting, GPL-3.0)
+    ModelSpec("rvm_mobilenetv3", "rvm_mobilenetv3_fp32.onnx", "rvm-1.0.0", 14975696, "matting",
+              "RVM MobileNetV3 · быстро", "Плавно даже на ноутбуке. Волосы и плечи без мерцания.",
+              RVM.format(file="rvm_mobilenetv3_fp32.onnx")),
+    ModelSpec("rvm_resnet50", "rvm_resnet50_fp32.onnx", "rvm-1.0.0", 107479165, "matting",
+              "RVM ResNet-50 · максимум", "Точнее по прядям волос и пальцам. Нужна видеокарта RTX.",
+              RVM.format(file="rvm_resnet50_fp32.onnx")),
 ]
 
 REGISTRY: Dict[str, ModelSpec] = {s.key: s for s in _SPECS}

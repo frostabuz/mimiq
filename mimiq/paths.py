@@ -63,6 +63,10 @@ def faces_dir() -> Path:
     return _ensure(user_data_dir() / "faces")
 
 
+def backgrounds_dir() -> Path:
+    return _ensure(user_data_dir() / "backgrounds")
+
+
 def certs_dir() -> Path:
     return _ensure(user_data_dir() / "certs")
 

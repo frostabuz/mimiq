@@ -1,17 +1,19 @@
-"""Right-hand settings column: Source · Swap · Mask · Output tabs."""
+"""Right-hand settings column: Source · Swap · Mask · Background · Output tabs."""
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
 
 from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtWidgets import (QButtonGroup, QFrame, QHBoxLayout, QLineEdit, QPushButton, QScrollArea, QSizePolicy,
-                               QStackedWidget, QToolButton, QVBoxLayout, QWidget)
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import (QButtonGroup, QColorDialog, QFileDialog, QFrame, QHBoxLayout, QLineEdit, QPushButton,
+                               QScrollArea, QSizePolicy, QStackedWidget, QToolButton, QVBoxLayout, QWidget)
 
-from .. import __version__
+from .. import __version__, paths
 from ..config import Settings
 from ..core import models
-from . import icons, theme
+from . import backgrounds, icons, theme
 from .widgets import (POINTER, Card, Combo, FieldRow, IconButton, Segmented, SettingRow, SliderRow, StatusDot,
                       ToggleSwitch, label)
 
@@ -76,6 +78,7 @@ class SettingsPanel(QFrame):
     vcamSetup = Signal(str)                # install | uninstall (Mimiq Camera)
     installTensorrt = Signal()
     checkUpdates = Signal()                # manual "Проверить сейчас"
+    notify = Signal(str, str)              # level, text (toast)
 
     def __init__(self, settings: Settings, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -90,7 +93,8 @@ class SettingsPanel(QFrame):
         head.setContentsMargins(2, 0, 8, 0)
         head.setSpacing(8)
         head.addWidget(label("Настройки", "h2"))
-        self.tabs = TabBar([("Источник", "camera"), ("Замена", "face"), ("Маска", "mask"), ("Вывод", "monitor")])
+        self.tabs = TabBar([("Источник", "camera"), ("Замена", "face"), ("Маска", "mask"), ("Фон", "image"),
+                            ("Вывод", "monitor")])
         tabs_box = QVBoxLayout()
         tabs_box.setSpacing(0)
         tabs_box.addWidget(self.tabs)
@@ -103,7 +107,8 @@ class SettingsPanel(QFrame):
         self.stack = QStackedWidget()
         outer.addWidget(self.stack, 1)
         self.tabs.changed.connect(self.stack.setCurrentIndex)
-        for build in (self._build_source, self._build_swap, self._build_mask, self._build_output):
+        for build in (self._build_source, self._build_swap, self._build_mask, self._build_background,
+                      self._build_output):
             page = QWidget()
             col = QVBoxLayout(page)
             col.setContentsMargins(2, 0, 8, 8)
@@ -354,6 +359,105 @@ class SettingsPanel(QFrame):
         col.addWidget(label("Совет: режим «Маска» под превью показывает, какая область заменяется.", "faint",
                             wrap=True))
 
+    # ================================================================== Background
+    def _build_background(self, col: QVBoxLayout) -> None:
+        card = Card("Фон", "image", "Размытие или замена фона за вами")
+        self.bg_seg = self._seg("bg_mode", [("off", "Выкл."), ("blur", "Размытие"), ("image", "Картинка"),
+                                            ("color", "Цвет")])
+        card.add(self.bg_seg)
+        # --- blur
+        self.bg_blur_box = QWidget()
+        bl = QVBoxLayout(self.bg_blur_box)
+        bl.setContentsMargins(0, 2, 0, 0)
+        bl.setSpacing(10)
+        bl.addWidget(self._slider("bg_blur", "Сила размытия", 0.0, 1.0, 0.01, pct,
+                                  "Размывается только комната: контур и волосы остаются чёткими, без ореола."))
+        card.add(self.bg_blur_box)
+        # --- picture
+        self.bg_image_box = QWidget()
+        il = QVBoxLayout(self.bg_image_box)
+        il.setContentsMargins(0, 2, 0, 0)
+        il.setSpacing(12)
+        self.bg_gallery = backgrounds.BackgroundGallery()
+        self.bg_gallery.picked.connect(lambda p: self._emit(bg_image=p))
+        self.bg_gallery.addRequested.connect(self._add_background)
+        self.bg_gallery.removeRequested.connect(self._remove_background)
+        il.addWidget(self.bg_gallery)
+        il.addWidget(self._slider("bg_image_blur", "Размытие картинки", 0.0, 1.0, 0.01, pct,
+                                  "Лёгкое размытие (10–25%) — как у настоящей камеры, фон выглядит естественнее."))
+        card.add(self.bg_image_box)
+        # --- colour
+        self.bg_color_box = QWidget()
+        cl = QVBoxLayout(self.bg_color_box)
+        cl.setContentsMargins(0, 2, 0, 0)
+        cl.setSpacing(8)
+        self.bg_swatches = backgrounds.ColorSwatches()
+        self.bg_swatches.picked.connect(lambda c: self._emit(bg_color=c))
+        self.bg_swatches.customRequested.connect(self._pick_bg_color)
+        self._binds.append(lambda s: self.bg_swatches.set_value(s.bg_color))
+        cl.addWidget(self.bg_swatches)
+        cl.addWidget(label("Зелёный — хромакей: в OBS его можно убрать фильтром «Хромакей» и поставить свой "
+                           "фон или видео.", "faint", wrap=True))
+        card.add(self.bg_color_box)
+        col.addWidget(card)
+
+        card = Card("Качество контура", "sparkles", "Нейросеть, которая отделяет вас от комнаты")
+        self.bg_model_combo = self._combo("bg_model", model_items("matting"))
+        self.bg_model_row = FieldRow("Модель", self.bg_model_combo, " ")
+        card.add(self.bg_model_row)
+        card.add(self._slider("bg_stability", "Стабильность контура", 0.0, 1.0, 0.01, pct,
+                              "Убирает мерцание краёв и волос между кадрами. Резкие движения отслеживаются "
+                              "без задержки."))
+        col.addWidget(card)
+        col.addWidget(label("Лучше всего — ровный свет спереди и стена без зеркал за спиной. Фон работает и без "
+                            "замены лица. Быстро включить — Ctrl+B. Модели RVM — лицензия GPL-3.0.", "faint",
+                            wrap=True))
+
+    def _refresh_gallery(self) -> None:
+        try:
+            backgrounds.ensure_defaults()
+        except Exception as exc:  # the gallery must never break the panel
+            self.notify.emit("warn", f"Не удалось подготовить стандартные фоны: {exc}")
+        files = backgrounds.list_images(paths.backgrounds_dir())
+        self.bg_gallery.set_items(files, self.s.bg_image)
+        self._gallery_ready = True
+        if not self.s.bg_image and files and self.s.bg_mode == "image":
+            self._emit(bg_image=str(files[0]))
+            self.bg_gallery.set_current(str(files[0]))
+
+    def _add_background(self) -> None:
+        f, _ = QFileDialog.getOpenFileName(self, "Изображение для фона", "",
+                                           "Изображения (*.jpg *.jpeg *.png *.webp *.bmp *.heic)")
+        if not f:
+            return
+        try:
+            path = backgrounds.import_image(f)
+        except Exception as exc:
+            self.notify.emit("error", f"Не удалось добавить фон: {exc}")
+            return
+        self._emit(bg_image=str(path))
+        self._refresh_gallery()
+
+    def _remove_background(self, path: str) -> None:
+        try:
+            paths_ok = paths.backgrounds_dir()
+            p = Path(path)
+            if p.parent.resolve() == paths_ok.resolve():
+                p.unlink(missing_ok=True)
+        except OSError as exc:
+            self.notify.emit("error", f"Не удалось удалить: {exc}")
+            return
+        if self.s.bg_image == path:
+            files = backgrounds.list_images(paths.backgrounds_dir())
+            self._emit(bg_image=str(files[0]) if files else "")
+        self._refresh_gallery()
+
+    def _pick_bg_color(self) -> None:
+        c = QColorDialog.getColor(QColor(self.s.bg_color), self, "Цвет фона")
+        if c.isValid():
+            self._emit(bg_color=c.name())
+            self.bg_swatches.set_value(c.name())
+
     # ================================================================== Output
     def _build_output(self, col: QVBoxLayout) -> None:
         card = Card("Виртуальная камера", "monitor", "Для Zoom, Teams, Discord, Telegram, OBS")
@@ -546,6 +650,7 @@ class SettingsPanel(QFrame):
 
     def refresh_model_marks(self) -> None:
         self.swapper_combo.set_items(model_items("swapper"), self.s.swapper_model)
+        self.bg_model_combo.set_items(model_items("matting"), self.s.bg_model)
         self.enhancer_combo.set_items(model_items("enhancer", "Выключено"), self.s.enhancer_model)
 
     # ================================================================== load / visibility
@@ -567,6 +672,14 @@ class SettingsPanel(QFrame):
         spec = models.REGISTRY.get(s.swapper_model)
         if spec is not None and self.swapper_row.hint is not None:
             self.swapper_row.hint.setText(spec.note or " ")
+        self.bg_blur_box.setVisible(s.bg_mode == "blur")
+        self.bg_image_box.setVisible(s.bg_mode == "image")
+        self.bg_color_box.setVisible(s.bg_mode == "color")
+        if s.bg_mode == "image" and not getattr(self, "_gallery_ready", False):
+            self._refresh_gallery()
+        spec = models.REGISTRY.get(s.bg_model)
+        if spec is not None and self.bg_model_row.hint is not None:
+            self.bg_model_row.hint.setText(spec.note or " ")
 
     def show_tab(self, index: int) -> None:
         self.tabs.set_index(index)
